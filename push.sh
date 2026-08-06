@@ -6,9 +6,9 @@ set -e
 cd "$(dirname "$0")"
 git add -A
 if git diff --cached --quiet; then
-  echo "変更はありません。"
-  exit 0
+  echo "コミットする新しい変更はありません（pushだけ試みます）。"
+else
+  git commit -m "update $(date '+%Y-%m-%d %H:%M:%S')"
 fi
-git commit -m "update $(date '+%Y-%m-%d %H:%M:%S')"
 git push
 echo "push完了。GitHub Pagesの反映まで1分ほど待ってからiPadでリロードしてください。"
