@@ -69,6 +69,30 @@
     touch-action: none;
     display: block;
   }
+  #recBadge {
+    position: absolute;
+    top: 10px;
+    right: 12px;
+    display: none;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: rgba(17, 24, 39, 0.85);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    pointer-events: none;
+    z-index: 5;
+  }
+  #recBadge.on { display: flex; }
+  #recBadge .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--danger);
+  }
   .controls {
     display: flex;
     gap: 10px;
@@ -87,6 +111,8 @@
   }
   button.secondary { background: #4b5563; }
   button.danger { background: var(--danger); }
+  button.playback { background: #7c3aed; }
+  button:disabled { opacity: 0.4; cursor: default; }
   button:active { opacity: 0.8; }
   #status {
     font-size: 13px;
@@ -114,6 +140,7 @@
 
   <div id="canvasWrap">
     <canvas id="drawCanvas"></canvas>
+    <div id="recBadge"><span class="dot"></span>REC</div>
   </div>
 
   <div id="status">ストローク数: <span id="strokeCount">0</span> / 総点数: <span id="pointCount">0</span></div>
@@ -121,6 +148,7 @@
   <div class="controls">
     <button id="undoBtn" class="secondary">元に戻す</button>
     <button id="clearBtn" class="danger">全消去</button>
+    <button id="playBtn" class="playback">▶ 再生</button>
     <button id="saveBtn">JSONを保存</button>
   </div>
 
@@ -144,6 +172,11 @@
   const statusPointCount = document.getElementById("pointCount");
   const logEl = document.getElementById("log");
   const labelInput = document.getElementById("labelInput");
+  const recBadge = document.getElementById("recBadge");
+  const undoBtn = document.getElementById("undoBtn");
+  const clearBtn = document.getElementById("clearBtn");
+  const saveBtn = document.getElementById("saveBtn");
+  const playBtn = document.getElementById("playBtn");
 
   let cssSize = 0;       // CSS上のキャンバス一辺の長さ(px)
   let dpr = window.devicePixelRatio || 1;
@@ -152,6 +185,7 @@
   let strokes = [];
   let currentStroke = null;
   let activePointerId = null;
+  let isPlaying = false; // 再生中は新規描画・他ボタンを無効化する
 
   function log(msg) {
     const t = new Date().toLocaleTimeString();
@@ -206,17 +240,46 @@
     ctx.stroke();
   }
 
+  // 正規化座標 -> ピクセル座標（toNormalizedの逆変換。グリッド線を引くために使う）
+  function fromNormalized(xNorm, yNorm) {
+    const half = cssSize / 2;
+    const xPx = (xNorm / TARGET_RANGE) * half + half;
+    const yPx = half - (yNorm / TARGET_RANGE) * half;
+    return [xPx, yPx];
+  }
+
+  // ラフな座標グリッド（目盛りは0.3刻み。正確さより「だいたいの位置感覚」重視）
+  function drawGuides() {
+    const ticks = [-0.9, -0.6, -0.3, 0, 0.3, 0.6, 0.9];
+    ctx.save();
+    ctx.font = "10px -apple-system, sans-serif";
+    ctx.fillStyle = "#9ca3af";
+    ctx.textBaseline = "top";
+
+    for (const v of ticks) {
+      const [xPx] = fromNormalized(v, 0);
+      const [, yPx] = fromNormalized(0, v);
+      const isOrigin = v === 0;
+
+      ctx.strokeStyle = isOrigin ? "#d1d5db" : "#eef0f3";
+      ctx.lineWidth = isOrigin ? 1.5 : 1;
+
+      ctx.beginPath();
+      ctx.moveTo(xPx, 0); ctx.lineTo(xPx, cssSize);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(0, yPx); ctx.lineTo(cssSize, yPx);
+      ctx.stroke();
+
+      ctx.fillText(v.toFixed(1), xPx + 2, 2);
+      ctx.fillText(v.toFixed(1), 2, yPx + 2);
+    }
+    ctx.restore();
+  }
+
   function redrawAll() {
     ctx.clearRect(0, 0, cssSize, cssSize);
-    // 中心の目印（デバッグ用の薄いガイド）
-    ctx.save();
-    ctx.strokeStyle = "#e5e7eb";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(cssSize / 2, 0); ctx.lineTo(cssSize / 2, cssSize);
-    ctx.moveTo(0, cssSize / 2); ctx.lineTo(cssSize, cssSize / 2);
-    ctx.stroke();
-    ctx.restore();
+    drawGuides();
 
     for (const s of strokes) {
       for (let i = 1; i < s.points.length; i++) {
@@ -247,10 +310,12 @@
   }
 
   function onPointerDown(evt) {
+    if (isPlaying) return;              // 再生中はペン入力を無視
     if (activePointerId !== null) return; // 同時多点は無視（1本ずつ記録）
     evt.preventDefault();
     canvas.setPointerCapture(evt.pointerId);
     activePointerId = evt.pointerId;
+    recBadge.classList.add("on");        // ペンが触れた瞬間に録画開始を表示
 
     const [xPx, yPx] = getLocalPos(evt);
     currentStroke = {
@@ -284,6 +349,7 @@
     }
     currentStroke = null;
     activePointerId = null;
+    recBadge.classList.remove("on");     // ペンが離れたら録画停止を表示
     updateCounts();
   }
 
@@ -322,6 +388,50 @@
     redrawAll();
     updateCounts();
     log("全ストロークを消去しました");
+  });
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function setControlsEnabled(enabled) {
+    undoBtn.disabled = !enabled;
+    clearBtn.disabled = !enabled;
+    saveBtn.disabled = !enabled;
+    playBtn.disabled = !enabled;
+  }
+
+  // 記録した実際のタイムスタンプ間隔どおりに再生し、キャプチャした軌跡の
+  // 時間的な忠実さ（速く描いた/ゆっくり描いた、の再現）を目視確認するための機能。
+  playBtn.addEventListener("click", async () => {
+    if (isPlaying || strokes.length === 0) {
+      if (strokes.length === 0) log("再生するストロークがありません");
+      return;
+    }
+    isPlaying = true;
+    setControlsEnabled(false);
+    log("再生開始");
+
+    ctx.clearRect(0, 0, cssSize, cssSize);
+    drawGuides();
+
+    for (const s of strokes) {
+      let prev = null;
+      for (const p of s.points) {
+        if (prev) {
+          const wait = p.t - prev.t;
+          await sleep(Math.max(0, wait));
+          drawSegment([prev.x_px, prev.y_px], [p.x_px, p.y_px]);
+        }
+        prev = p;
+      }
+      await sleep(250); // ストローク間の一息（実際の間隔ではなく固定の短い間）
+    }
+
+    log("再生終了");
+    isPlaying = false;
+    setControlsEnabled(true);
+    redrawAll();
   });
 
   document.getElementById("saveBtn").addEventListener("click", () => {
