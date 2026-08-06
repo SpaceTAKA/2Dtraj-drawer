@@ -112,6 +112,7 @@
   button.secondary { background: #4b5563; }
   button.danger { background: var(--danger); }
   button.playback { background: #7c3aed; }
+  button.add { background: #059669; }
   button:disabled { opacity: 0.4; cursor: default; }
   button:active { opacity: 0.8; }
   #status {
@@ -120,6 +121,52 @@
     text-align: center;
     min-height: 18px;
   }
+  #familyPanel {
+    width: var(--canvas-size);
+    max-width: 100%;
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+    padding: 10px 12px;
+  }
+  #familyHeader {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink);
+    margin-bottom: 6px;
+  }
+  #familyList {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 160px;
+    overflow-y: auto;
+    margin-bottom: 8px;
+  }
+  .family-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    padding: 4px 6px;
+    border-radius: 6px;
+    background: #f9fafb;
+  }
+  .family-item .swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .family-item .label { flex: 1; color: var(--ink); }
+  .family-item button {
+    padding: 3px 8px;
+    font-size: 11px;
+    border-radius: 6px;
+  }
+  .family-item button.edit { background: #4b5563; }
+  .family-item button.del { background: var(--danger); }
+  #exportBtn { width: 100%; }
   #log {
     width: var(--canvas-size);
     max-width: 100%;
@@ -149,7 +196,13 @@
     <button id="undoBtn" class="secondary">元に戻す</button>
     <button id="clearBtn" class="danger">全消去</button>
     <button id="playBtn" class="playback">▶ 再生</button>
-    <button id="saveBtn">JSONを保存</button>
+    <button id="addBtn" class="add">＋ Familyに追加</button>
+  </div>
+
+  <div id="familyPanel">
+    <div id="familyHeader">Family: <span id="familyCount">0</span> seqs / <span id="familyTimesteps">0</span> timesteps</div>
+    <div id="familyList"></div>
+    <button id="exportBtn">Familyを書き出す (JSON)</button>
   </div>
 
   <div id="log"></div>
@@ -164,6 +217,8 @@
   // ------------------------------------------------------------------
   const TARGET_RANGE = 0.9; // tanh飽和を避けるため ±0.9 に収める
   const MAX_POINTS_PER_FRAME_LOG = false;
+  // Familyメンバーを見分けるための薄色パレット（順番に使い回す）
+  const FAMILY_COLORS = ["#2563eb", "#059669", "#d97706", "#db2777", "#7c3aed", "#0891b2", "#dc2626", "#65a30d"];
 
   const canvas = document.getElementById("drawCanvas");
   const ctx = canvas.getContext("2d", { desynchronized: true });
@@ -176,19 +231,29 @@
   const recBadge = document.getElementById("recBadge");
   const undoBtn = document.getElementById("undoBtn");
   const clearBtn = document.getElementById("clearBtn");
-  const saveBtn = document.getElementById("saveBtn");
+  const addBtn = document.getElementById("addBtn");
+  const exportBtn = document.getElementById("exportBtn");
   const playBtn = document.getElementById("playBtn");
+  const familyCountEl = document.getElementById("familyCount");
+  const familyTimestepsEl = document.getElementById("familyTimesteps");
+  const familyListEl = document.getElementById("familyList");
 
   let cssSize = 0;       // CSS上のキャンバス一辺の長さ(px)
   let dpr = window.devicePixelRatio || 1;
 
-  // 記録データ本体: strokes = [ {pointerType, points: [...]} , ... ]
+  // 記録データ本体: strokes = [ {pointerType, points: [...]} , ... ]  <- 今まさに描いている「下書き」
   let strokes = [];
   let currentStroke = null;
   let activePointerId = null;
   let isPlaying = false; // 再生中は新規描画・他ボタンを無効化する
   let strokeStartPerf = null; // 現在のストローク開始時刻(performance.now())
   let liveTickRunning = false;  // 経過時間・timestepsのライブ更新ループが動いているか
+
+  // Family: ＋ボタンで確定した(下書きから昇格した)シーケンス群。
+  // 各要素が1つの(T,2)シーケンス。書き出すと(T, Nseq, 2)相当のデータになる。
+  // family = [ {id, color, pointerType, points: [...]} , ... ]
+  let family = [];
+  let familyIdCounter = 0;
 
   function log(msg) {
     const t = new Date().toLocaleTimeString();
@@ -243,6 +308,22 @@
     ctx.stroke();
   }
 
+  // 保存済みの点列をまとめて描く（Familyのうっすら表示・アクティブな下書きの再描画に使用）
+  function drawPolyline(points, color, alpha) {
+    if (points.length < 2) return;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    ctx.moveTo(points[0].x_px, points[0].y_px);
+    for (let i = 1; i < points.length; i++) ctx.lineTo(points[i].x_px, points[i].y_px);
+    ctx.stroke();
+    ctx.restore();
+  }
+
   // 正規化座標 -> ピクセル座標（toNormalizedの逆変換。グリッド線を引くために使う）
   function fromNormalized(xNorm, yNorm) {
     const half = cssSize / 2;
@@ -284,11 +365,13 @@
     ctx.clearRect(0, 0, cssSize, cssSize);
     drawGuides();
 
+    // Familyメンバーはうっすら色付きで（過去に何を描いたか分かるように）
+    for (const m of family) {
+      drawPolyline(m.points, m.color, 0.35);
+    }
+    // 今アクティブな下書きは濃い黒で上から重ねる
     for (const s of strokes) {
-      for (let i = 1; i < s.points.length; i++) {
-        drawSegment([s.points[i - 1].x_px, s.points[i - 1].y_px],
-                    [s.points[i].x_px, s.points[i].y_px]);
-      }
+      drawPolyline(s.points, "#111827", 1);
     }
   }
 
@@ -368,6 +451,75 @@
     statusPointCount.textContent = totalPoints;
   }
 
+  // ------------------------------------------------------------------
+  // Family（複数シーケンスの積み上げ）
+  // ------------------------------------------------------------------
+  function addToFamily() {
+    if (strokes.length === 0) {
+      log("Familyに追加する下書きがありません");
+      return;
+    }
+    // 現在下書き中の各ストロークを、それぞれ独立した1シーケンスとして昇格させる
+    // (複数ストロークをまとめて1本の(T,2)に結合すると、ストローク間で
+    //  ワープしたような不自然な区間ができてしまうため、別々のシーケンスにする)
+    for (const s of strokes) {
+      family.push({
+        id: familyIdCounter++,
+        color: FAMILY_COLORS[family.length % FAMILY_COLORS.length],
+        pointerType: s.pointerType,
+        points: s.points,
+      });
+    }
+    const added = strokes.length;
+    strokes = [];
+    currentStroke = null;
+    redrawAll();
+    updateCounts();
+    updateFamilyUI();
+    log(`Familyに${added}件追加しました（合計${family.length}件）`);
+  }
+
+  function deleteFamilyMember(id) {
+    family = family.filter((m) => m.id !== id);
+    redrawAll();
+    updateFamilyUI();
+    log("Familyから1件削除しました");
+  }
+
+  function editFamilyMember(id) {
+    const idx = family.findIndex((m) => m.id === id);
+    if (idx === -1) return;
+    const m = family[idx];
+    family.splice(idx, 1);
+    // 下書きに戻して、undo/全消去などで編集し直せるようにする
+    strokes.push({ index: strokes.length, pointerType: m.pointerType, points: m.points });
+    redrawAll();
+    updateCounts();
+    updateFamilyUI();
+    log("Familyから下書きに戻しました。編集し終えたら再度＋で追加してください");
+  }
+
+  function updateFamilyUI() {
+    familyCountEl.textContent = family.length;
+    const totalTimesteps = family.reduce((acc, m) => acc + m.points.length, 0);
+    familyTimestepsEl.textContent = totalTimesteps;
+
+    familyListEl.innerHTML = "";
+    family.forEach((m, i) => {
+      const row = document.createElement("div");
+      row.className = "family-item";
+      row.innerHTML = `
+        <span class="swatch" style="background:${m.color}"></span>
+        <span class="label">Seq ${i}: ${m.points.length} timesteps</span>
+        <button class="edit">編集</button>
+        <button class="del">削除</button>
+      `;
+      row.querySelector(".edit").addEventListener("click", () => editFamilyMember(m.id));
+      row.querySelector(".del").addEventListener("click", () => deleteFamilyMember(m.id));
+      familyListEl.appendChild(row);
+    });
+  }
+
   // レコーディング中（ペンが触れている間）、経過時間とtimesteps数を
   // リアルタイムに更新し続けるループ。pointermoveの発火頻度に依存させないよう
   // requestAnimationFrameで独立に回す。
@@ -416,6 +568,8 @@
     log("全ストロークを消去しました");
   });
 
+  addBtn.addEventListener("click", addToFamily);
+
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
@@ -423,7 +577,8 @@
   function setControlsEnabled(enabled) {
     undoBtn.disabled = !enabled;
     clearBtn.disabled = !enabled;
-    saveBtn.disabled = !enabled;
+    addBtn.disabled = !enabled;
+    exportBtn.disabled = !enabled;
     playBtn.disabled = !enabled;
   }
 
@@ -440,6 +595,9 @@
 
     ctx.clearRect(0, 0, cssSize, cssSize);
     drawGuides();
+    for (const m of family) {
+      drawPolyline(m.points, m.color, 0.35);
+    }
 
     for (const s of strokes) {
       let prev = null;
@@ -460,15 +618,18 @@
     redrawAll();
   });
 
-  document.getElementById("saveBtn").addEventListener("click", () => {
-    if (strokes.length === 0) {
-      log("保存する軌跡がありません");
+  exportBtn.addEventListener("click", () => {
+    if (family.length === 0) {
+      log("書き出すFamilyがありません（＋で追加してください）");
       return;
+    }
+    if (strokes.length > 0) {
+      log("注意: 下書き中の描画はFamilyに未追加です。含めたい場合は先に＋を押してください");
     }
     const payload = {
       meta: {
         app: "ipad-trajectory-capture",
-        version: 1,
+        version: 2,
         recordedAt: new Date().toISOString(),
         label: labelInput.value || null,
         canvas: { size_px: cssSize, dpr: dpr },
@@ -482,20 +643,27 @@
           clock: "PointerEvent.timeStamp (performance.now()系, 単調増加の高分解能タイムスタンプ)",
           sampling: "native (未リサンプリング)。固定Hzへの変換は前処理スクリプト側で実施する想定。",
         },
+        n_seq: family.length,
       },
-      strokes: strokes,
+      // family[i] が1シーケンス(T_i, 2)。前処理スクリプト側でpadding+maskして
+      // (Nseq, Tmax, 2) または (Tmax, Nseq, 2) にまとめる想定。
+      family: family.map((m, i) => ({
+        seq: i,
+        pointerType: m.pointerType,
+        points: m.points,
+      })),
     };
     const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     const stamp = payload.meta.recordedAt.replace(/[:.]/g, "-");
     a.href = url;
-    a.download = `trajectory_${stamp}.json`;
+    a.download = `family_${stamp}.json`;
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-    log(`保存しました: ${strokes.length}ストローク`);
+    log(`書き出しました: ${family.length}シーケンス`);
   });
 
   // ------------------------------------------------------------------
@@ -503,6 +671,7 @@
   // ------------------------------------------------------------------
   resizeCanvas();
   updateCounts();
+  updateFamilyUI();
   log("準備完了。Apple Pencilで描いてください。");
 })();
 </script>

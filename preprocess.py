@@ -16,15 +16,22 @@ RNN学習用の numpy 配列 (T, 2) 群に変換する前処理スクリプト�
     このスクリプトは両方に対応する。
 
 使い方:
-    python preprocess.py trajectory_2026-08-06.json --hz 20 --out dataset.npz
+    python preprocess.py family_2026-08-06.json --hz 20 --out dataset.npz
     python preprocess.py data_dir/ --hz 20 --out dataset.npz   # ディレクトリ内の*.jsonをまとめて処理
 
+対応する入力フォーマット:
+    - "family" キー（v2、アプリのFamily機能で書き出したもの）
+    - "strokes" キー（v1、旧フォーマット）にも後方互換で対応
+
 出力 (npz) の中身:
-    strokes_xy   : object配列。strokes_xy[i] は shape (T_i, 2) のfloat32配列（各ストローク自然長のまま）
-    strokes_meta : object配列。各ストロークの label / pointerType などのdict
-    padded_xy    : shape (N, Tmax, 2) のfloat32配列（0パディング済み）
-    mask         : shape (N, Tmax) のfloat32配列（1=実データ, 0=パディング）
-    hz           : リサンプリングに使ったレート(Hz)
+    strokes_xy        : object配列。strokes_xy[i] は shape (T_i, 2) のfloat32配列（各シーケンス自然長のまま）
+    strokes_meta      : object配列。各シーケンスの label / pointerType などのdict
+    padded_xy         : shape (Nseq, Tmax, 2) のfloat32配列（0パディング済み、batch-first）
+    mask              : shape (Nseq, Tmax) のfloat32配列（1=実データ, 0=パディング、batch-first）
+    padded_xy_time_first : shape (Tmax, Nseq, 2)。PyTorchのRNN/GRU/LSTMのデフォルト
+                           (batch_first=False, つまり (seq_len, batch, input_size)) にそのまま渡せる並び。
+    mask_time_first   : shape (Tmax, Nseq)。padded_xy_time_firstに対応するmask。
+    hz                : リサンプリングに使ったレート(Hz)
 """
 
 from __future__ import annotations
@@ -91,14 +98,19 @@ def load_dataset(path_arg: str, hz: float):
     for fp in files:
         data = load_json_file(fp)
         meta = data.get("meta", {})
-        for stroke in data.get("strokes", []):
-            xy = resample_stroke_to_fixed_hz(stroke["points"], hz)
+        # v2: "family" キー、v1: "strokes" キー（後方互換）
+        sequences = data.get("family")
+        if sequences is None:
+            sequences = data.get("strokes", [])
+
+        for seq_item in sequences:
+            xy = resample_stroke_to_fixed_hz(seq_item["points"], hz)
             strokes_xy.append(xy)
             strokes_meta.append({
                 "source_file": str(fp.name),
                 "label": meta.get("label"),
-                "pointerType": stroke.get("pointerType"),
-                "n_points_raw": len(stroke["points"]),
+                "pointerType": seq_item.get("pointerType"),
+                "n_points_raw": len(seq_item["points"]),
                 "n_points_resampled": int(xy.shape[0]),
             })
 
@@ -141,6 +153,9 @@ def main():
           f"mean={np.mean(lengths):.1f}  (hz={args.hz})")
 
     padded, mask = pad_and_mask(strokes_xy)
+    # (Nseq, Tmax, 2) -> (Tmax, Nseq, 2)。PyTorchのbatch_first=Falseにそのまま渡せる並び。
+    padded_time_first = np.transpose(padded, (1, 0, 2))
+    mask_time_first = np.transpose(mask, (1, 0))
 
     np.savez_compressed(
         args.out,
@@ -148,10 +163,13 @@ def main():
         strokes_meta=np.array(strokes_meta, dtype=object),
         padded_xy=padded,
         mask=mask,
+        padded_xy_time_first=padded_time_first,
+        mask_time_first=mask_time_first,
         hz=args.hz,
     )
     print(f"保存しました: {args.out}  "
-          f"(padded_xy shape={padded.shape}, mask shape={mask.shape})")
+          f"(padded_xy shape={padded.shape} [Nseq,Tmax,2], "
+          f"padded_xy_time_first shape={padded_time_first.shape} [Tmax,Nseq,2])")
 
 
 if __name__ == "__main__":
