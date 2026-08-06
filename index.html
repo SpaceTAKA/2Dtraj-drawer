@@ -15,13 +15,14 @@
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body {
-    margin: 0; padding: 0; height: 100%;
+    margin: 0; padding: 0; min-height: 100%;
     background: var(--bg);
     font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic", sans-serif;
     color: var(--ink);
-    /* iPadでのスクロール・バウンス・Pencilでのスクリブル干渉を防ぐ */
+    /* ページ全体のtouch-action:noneはやめる（キャンバス外のスクロールが
+       できなくなり、あるところまでスクロールすると戻れなくなるバグの原因だった）。
+       スクロール抑止はキャンバス自体(#canvasWrap / #drawCanvas)だけに絞る。 */
     overscroll-behavior: none;
-    touch-action: none;
   }
   .app {
     display: flex;
@@ -138,8 +139,8 @@
   #familyList {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    max-height: 160px;
+    gap: 6px;
+    max-height: 260px;
     overflow-y: auto;
     margin-bottom: 8px;
   }
@@ -151,6 +152,15 @@
     padding: 4px 6px;
     border-radius: 6px;
     background: #f9fafb;
+  }
+  .family-item.editing-locked { opacity: 0.45; }
+  .family-item canvas.thumb {
+    width: 40px;
+    height: 40px;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    background: #fff;
+    flex-shrink: 0;
   }
   .family-item .swatch {
     width: 10px;
@@ -164,9 +174,22 @@
     font-size: 11px;
     border-radius: 6px;
   }
+  .family-item button.play { background: #7c3aed; }
   .family-item button.edit { background: #4b5563; }
   .family-item button.del { background: var(--danger); }
   #exportBtn { width: 100%; }
+  #editBanner {
+    width: var(--canvas-size);
+    max-width: 100%;
+    background: #fef3c7;
+    color: #92400e;
+    border: 1px solid #fde68a;
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    text-align: center;
+  }
   #log {
     width: var(--canvas-size);
     max-width: 100%;
@@ -197,7 +220,10 @@
     <button id="clearBtn" class="danger">全消去</button>
     <button id="playBtn" class="playback">▶ 再生</button>
     <button id="addBtn" class="add">＋ Familyに追加</button>
+    <button id="editConfirmBtn" class="add" style="display:none;">✓ 編集を確定</button>
+    <button id="editCancelBtn" class="secondary" style="display:none;">✕ 編集をキャンセル</button>
   </div>
+  <div id="editBanner" style="display:none;"></div>
 
   <div id="familyPanel">
     <div id="familyHeader">Family: <span id="familyCount">0</span> seqs / <span id="familyTimesteps">0</span> timesteps</div>
@@ -234,6 +260,9 @@
   const addBtn = document.getElementById("addBtn");
   const exportBtn = document.getElementById("exportBtn");
   const playBtn = document.getElementById("playBtn");
+  const editConfirmBtn = document.getElementById("editConfirmBtn");
+  const editCancelBtn = document.getElementById("editCancelBtn");
+  const editBanner = document.getElementById("editBanner");
   const familyCountEl = document.getElementById("familyCount");
   const familyTimestepsEl = document.getElementById("familyTimesteps");
   const familyListEl = document.getElementById("familyList");
@@ -254,6 +283,8 @@
   // family = [ {id, color, pointerType, points: [...]} , ... ]
   let family = [];
   let familyIdCounter = 0;
+  let editingId = null;       // 編集中のFamilyメンバーのid（null = 編集中でない）
+  let editingOriginal = null; // キャンセル時に復元するための編集前スナップショット {id,color,pointerType,points,listIndex}
 
   function log(msg) {
     const t = new Date().toLocaleTimeString();
@@ -454,7 +485,20 @@
   // ------------------------------------------------------------------
   // Family（複数シーケンスの積み上げ）
   // ------------------------------------------------------------------
+
+  // 現在使われていない色を優先して割り当てる（削除・編集後に色がインデックスで
+  // ズレて、無関係なSeq同士が同じ色に被ってしまう問題を避けるため）。
+  // パレットを使い切ったらidベースで巡回する。
+  function pickFamilyColor() {
+    const used = new Set(family.map((m) => m.color));
+    for (const c of FAMILY_COLORS) {
+      if (!used.has(c)) return c;
+    }
+    return FAMILY_COLORS[familyIdCounter % FAMILY_COLORS.length];
+  }
+
   function addToFamily() {
+    if (editingId !== null) return; // 編集中は他の操作を禁止
     if (strokes.length === 0) {
       log("Familyに追加する下書きがありません");
       return;
@@ -465,7 +509,7 @@
     for (const s of strokes) {
       family.push({
         id: familyIdCounter++,
-        color: FAMILY_COLORS[family.length % FAMILY_COLORS.length],
+        color: pickFamilyColor(),
         pointerType: s.pointerType,
         points: s.points,
       });
@@ -480,23 +524,155 @@
   }
 
   function deleteFamilyMember(id) {
+    if (editingId !== null || isPlaying) return; // 編集中・再生中は他を触れない
     family = family.filter((m) => m.id !== id);
     redrawAll();
     updateFamilyUI();
     log("Familyから1件削除しました");
   }
 
-  function editFamilyMember(id) {
+  // 編集開始: 対象を一旦Familyから取り出し、下書きキャンバスに載せる。
+  // 完了(確定/キャンセル)するまで、他のFamily操作・＋・書き出しはすべて無効化する。
+  function startEdit(id) {
+    if (editingId !== null || isPlaying) return; // 二重編集・再生中の編集開始を禁止
     const idx = family.findIndex((m) => m.id === id);
     if (idx === -1) return;
     const m = family[idx];
+    editingId = id;
+    editingOriginal = { id: m.id, color: m.color, pointerType: m.pointerType, points: m.points, listIndex: idx };
     family.splice(idx, 1);
-    // 下書きに戻して、undo/全消去などで編集し直せるようにする
-    strokes.push({ index: strokes.length, pointerType: m.pointerType, points: m.points });
+    strokes = [{ index: 0, pointerType: m.pointerType, points: m.points }];
+    currentStroke = null;
     redrawAll();
     updateCounts();
+    setEditModeUI(true);
+    log(`Seq編集中: 描き直して「編集を確定」、やめる場合は「編集をキャンセル」を押してください`);
+  }
+
+  function confirmEdit() {
+    if (editingId === null) return;
+    if (strokes.length === 0) {
+      log("編集後の描画が空です。描き直すか、キャンセルしてください");
+      return;
+    }
+    // 最初のストロークが元のSeqを置き換える(id・色・表示順を維持)。
+    // 編集中にさらにストロークを追加していた場合は、それらは新規Seqとして追加する。
+    const [first, ...rest] = strokes;
+    const insertAt = Math.min(editingOriginal.listIndex, family.length);
+    family.splice(insertAt, 0, {
+      id: editingOriginal.id,
+      color: editingOriginal.color,
+      pointerType: first.pointerType,
+      points: first.points,
+    });
+    for (const s of rest) {
+      family.push({ id: familyIdCounter++, color: pickFamilyColor(), pointerType: s.pointerType, points: s.points });
+    }
+    strokes = [];
+    currentStroke = null;
+    editingId = null;
+    editingOriginal = null;
+    redrawAll();
+    updateCounts();
+    setEditModeUI(false);
+    log("編集を確定しました");
+  }
+
+  function cancelEdit() {
+    if (editingId === null) return;
+    const insertAt = Math.min(editingOriginal.listIndex, family.length);
+    family.splice(insertAt, 0, {
+      id: editingOriginal.id,
+      color: editingOriginal.color,
+      pointerType: editingOriginal.pointerType,
+      points: editingOriginal.points,
+    });
+    strokes = [];
+    currentStroke = null;
+    editingId = null;
+    editingOriginal = null;
+    redrawAll();
+    updateCounts();
+    setEditModeUI(false);
+    log("編集をキャンセルしました（元の内容に戻しました）");
+  }
+
+  function setEditModeUI(editing) {
+    addBtn.style.display = editing ? "none" : "";
+    editConfirmBtn.style.display = editing ? "" : "none";
+    editCancelBtn.style.display = editing ? "" : "none";
+    editBanner.style.display = editing ? "" : "none";
+    editBanner.textContent = editing ? "編集中… 完了するまで他のSeqの編集・削除・書き出しはできません" : "";
+    exportBtn.disabled = editing;
+    playBtn.disabled = editing;
     updateFamilyUI();
-    log("Familyから下書きに戻しました。編集し終えたら再度＋で追加してください");
+  }
+
+  // Family内の1シーケンスだけを、記録どおりの間隔で見るための再生（編集や削除はしない）
+  async function playbackFamilyMember(id) {
+    if (isPlaying || editingId !== null) return;
+    const m = family.find((x) => x.id === id);
+    if (!m || m.points.length < 2) return;
+
+    isPlaying = true;
+    setControlsEnabled(false);
+    updateFamilyUI();
+    redrawAll();
+
+    let prev = null;
+    for (const p of m.points) {
+      if (prev) {
+        await sleep(Math.max(0, p.t - prev.t));
+        ctx.save();
+        ctx.strokeStyle = m.color;
+        ctx.globalAlpha = 1;
+        ctx.lineWidth = 3;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        ctx.moveTo(prev.x_px, prev.y_px);
+        ctx.lineTo(p.x_px, p.y_px);
+        ctx.stroke();
+        ctx.restore();
+      }
+      prev = p;
+    }
+
+    isPlaying = false;
+    setControlsEnabled(true);
+    updateFamilyUI();
+    redrawAll();
+  }
+
+  // 各Seqのサムネイル: そのシーケンス自身のバウンディングボックスに合わせて
+  // 拡大縮小して描く（一覧で「どれがどれか」を一目で見分けるためのUIなので、
+  // 正規化座標の絶対スケールは無視して見やすさを優先する）。
+  function renderThumbnail(canvasEl, points, color) {
+    const tctx = canvasEl.getContext("2d");
+    const w = canvasEl.width, h = canvasEl.height;
+    tctx.clearRect(0, 0, w, h);
+    if (points.length < 2) return;
+
+    const xs = points.map((p) => p.x_px), ys = points.map((p) => p.y_px);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    const spanX = Math.max(maxX - minX, 1e-6), spanY = Math.max(maxY - minY, 1e-6);
+    const pad = 5;
+    const scale = Math.min((w - 2 * pad) / spanX, (h - 2 * pad) / spanY);
+    const offX = pad + (w - 2 * pad - spanX * scale) / 2;
+    const offY = pad + (h - 2 * pad - spanY * scale) / 2;
+
+    tctx.strokeStyle = color;
+    tctx.lineWidth = 2;
+    tctx.lineCap = "round";
+    tctx.lineJoin = "round";
+    tctx.beginPath();
+    points.forEach((p, i) => {
+      const px = offX + (p.x_px - minX) * scale;
+      const py = offY + (p.y_px - minY) * scale;
+      if (i === 0) tctx.moveTo(px, py); else tctx.lineTo(px, py);
+    });
+    tctx.stroke();
   }
 
   function updateFamilyUI() {
@@ -504,17 +680,23 @@
     const totalTimesteps = family.reduce((acc, m) => acc + m.points.length, 0);
     familyTimestepsEl.textContent = totalTimesteps;
 
+    const locked = editingId !== null || isPlaying; // 編集中・再生中は一覧の操作を全ロック
+
     familyListEl.innerHTML = "";
     family.forEach((m, i) => {
       const row = document.createElement("div");
-      row.className = "family-item";
+      row.className = "family-item" + (locked ? " editing-locked" : "");
       row.innerHTML = `
+        <canvas class="thumb" width="80" height="80"></canvas>
         <span class="swatch" style="background:${m.color}"></span>
         <span class="label">Seq ${i}: ${m.points.length} timesteps</span>
-        <button class="edit">編集</button>
-        <button class="del">削除</button>
+        <button class="play" ${locked ? "disabled" : ""}>▶</button>
+        <button class="edit" ${locked ? "disabled" : ""}>編集</button>
+        <button class="del" ${locked ? "disabled" : ""}>削除</button>
       `;
-      row.querySelector(".edit").addEventListener("click", () => editFamilyMember(m.id));
+      renderThumbnail(row.querySelector("canvas.thumb"), m.points, m.color);
+      row.querySelector(".play").addEventListener("click", () => playbackFamilyMember(m.id));
+      row.querySelector(".edit").addEventListener("click", () => startEdit(m.id));
       row.querySelector(".del").addEventListener("click", () => deleteFamilyMember(m.id));
       familyListEl.appendChild(row);
     });
@@ -569,6 +751,8 @@
   });
 
   addBtn.addEventListener("click", addToFamily);
+  editConfirmBtn.addEventListener("click", confirmEdit);
+  editCancelBtn.addEventListener("click", cancelEdit);
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -580,17 +764,20 @@
     addBtn.disabled = !enabled;
     exportBtn.disabled = !enabled;
     playBtn.disabled = !enabled;
+    editConfirmBtn.disabled = !enabled;
+    editCancelBtn.disabled = !enabled;
   }
 
   // 記録した実際のタイムスタンプ間隔どおりに再生し、キャプチャした軌跡の
   // 時間的な忠実さ（速く描いた/ゆっくり描いた、の再現）を目視確認するための機能。
   playBtn.addEventListener("click", async () => {
-    if (isPlaying || strokes.length === 0) {
+    if (isPlaying || editingId !== null || strokes.length === 0) {
       if (strokes.length === 0) log("再生するストロークがありません");
       return;
     }
     isPlaying = true;
     setControlsEnabled(false);
+    updateFamilyUI();
     log("再生開始");
 
     ctx.clearRect(0, 0, cssSize, cssSize);
@@ -615,6 +802,7 @@
     log("再生終了");
     isPlaying = false;
     setControlsEnabled(true);
+    updateFamilyUI();
     redrawAll();
   });
 
