@@ -87,6 +87,9 @@
   #canvasWrap.ruler-mode {
     border-color: #0ea5e9;
   }
+  #canvasWrap.guide-mode {
+    border-color: #16a34a;
+  }
   #drawCanvas {
     position: absolute;
     inset: 0;
@@ -236,7 +239,9 @@
   <div class="mode-row">
     <button id="modeDrawBtn" class="mode-btn active">✏️ 描画モード</button>
     <button id="modeRulerBtn" class="mode-btn">📐 ルーラーモード</button>
+    <button id="modeGuideBtn" class="mode-btn">🧭 ガイドモード</button>
     <button id="rulerClearBtn" class="secondary">ルーラー削除</button>
+    <button id="guideClearBtn" class="secondary">ガイド削除</button>
   </div>
 
   <div id="canvasWrap">
@@ -299,7 +304,9 @@
   const familyListEl = document.getElementById("familyList");
   const modeDrawBtn = document.getElementById("modeDrawBtn");
   const modeRulerBtn = document.getElementById("modeRulerBtn");
+  const modeGuideBtn = document.getElementById("modeGuideBtn");
   const rulerClearBtn = document.getElementById("rulerClearBtn");
+  const guideClearBtn = document.getElementById("guideClearBtn");
 
   let cssSize = 0;       // CSS上のキャンバス一辺の長さ(px)
   let dpr = window.devicePixelRatio || 1;
@@ -322,15 +329,25 @@
 
   // ------------------------------------------------------------------
   // ルーラー（ステンシルのように、自分で描いた形の"内側"には描画できない
-  // 移動可能なガイド）。記録データ(t,x,y)には一切含まれない、あくまでUI上のガイド。
+  // 移動可能なガイド）とガイド（同じ操作感だが、描画をブロックせず、
+  // ただ薄く「ここをなぞるといい」と示すだけの補助線）。
+  // どちらも記録データ(t,x,y)には一切含まれない、あくまでUI上のガイド。
   // ------------------------------------------------------------------
-  let mode = "draw"; // "draw" | "ruler"
+  let mode = "draw"; // "draw" | "ruler" | "guide"
   let ruler = null;  // { points: [{x_px,y_px}, ...], offsetX, offsetY } | null
   let rulerDragPointerId = null;
   let rulerDragMode = null;      // "move" | "draw"
   let rulerDraftPoints = null;   // ルーラーの形を新規に描いている間の一時点列
   let rulerDragStart = null;     // {x,y} 移動開始時のポインタ位置
   let rulerOffsetStart = null;   // {x,y} 移動開始時のruler.offset
+
+  let guide = null;  // { points: [{x_px,y_px}, ...], offsetX, offsetY } | null
+  let guideDragPointerId = null;
+  let guideDragMode = null;      // "move" | "draw"
+  let guideDraftPoints = null;
+  let guideDragStart = null;
+  let guideOffsetStart = null;
+  const GUIDE_DRAG_THRESHOLD = 24; // ガイドの線からこの距離(px)以内を触ったら「移動」とみなす
 
   function log(msg) {
     const t = new Date().toLocaleTimeString();
@@ -450,7 +467,8 @@
     for (const s of strokes) {
       drawPolyline(s.points, "#111827", 1);
     }
-    drawRulerOverlay(); // ルーラーは一番上に重ねて、どこが描けないか常に見えるようにする
+    drawGuideOverlay();  // ガイド: 薄く「ここをなぞるといい」を示すだけ（描画はブロックしない）
+    drawRulerOverlay();  // ルーラーは一番上に重ねて、どこが描けないか常に見えるようにする
   }
 
   // ------------------------------------------------------------------
@@ -490,24 +508,31 @@
     return { x, y, dist2: dx * dx + dy * dy };
   }
 
+  // 折れ線(points)上の最近接点を探す。closed=trueなら最後の点から最初の点への
+  // 辺も含める（ルーラーのような閉じた形）。closed=falseなら開いた線として扱う（ガイド用）。
+  function closestPointOnPolyline(px, py, points, closed) {
+    let best = null;
+    const segCount = closed ? points.length : points.length - 1;
+    for (let i = 0; i < segCount; i++) {
+      const a = points[i], b = points[(i + 1) % points.length];
+      const c = closestPointOnSegment(px, py, a.x_px, a.y_px, b.x_px, b.y_px);
+      if (!best || c.dist2 < best.dist2) best = c;
+    }
+    return best;
+  }
+
   // ルーラーの縁（各辺のうち最も近い1点）に点を吸着させる。実物の定規のように
   // 「縁に沿ってなぞる」動きを再現するため、内側に入った点はここに丸め込む。
   function clampToRulerBoundary(xPx, yPx) {
-    const abs = getRulerAbsolutePoints();
-    let best = null;
-    for (let i = 0; i < abs.length; i++) {
-      const a = abs[i], b = abs[(i + 1) % abs.length];
-      const c = closestPointOnSegment(xPx, yPx, a.x_px, a.y_px, b.x_px, b.y_px);
-      if (!best || c.dist2 < best.dist2) best = c;
-    }
+    const best = closestPointOnPolyline(xPx, yPx, getRulerAbsolutePoints(), true);
     return best ? [best.x, best.y] : [xPx, yPx];
   }
 
-  function drawRulerPolygon(points, closeAndFill) {
+  function drawGuideLikePolyline(points, color, closeAndFill) {
     if (points.length < 2) return;
     ctx.save();
     ctx.setLineDash([6, 4]);
-    ctx.strokeStyle = "#0ea5e9";
+    ctx.strokeStyle = color;
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(points[0].x_px, points[0].y_px);
@@ -516,15 +541,36 @@
       ctx.closePath();
       ctx.fillStyle = "rgba(14,165,233,0.15)";
       ctx.fill();
+    } else {
+      ctx.globalAlpha = 0.6;
     }
     ctx.stroke();
     ctx.restore();
   }
 
   function drawRulerOverlay() {
-    if (ruler) drawRulerPolygon(getRulerAbsolutePoints(), true);
+    if (ruler) drawGuideLikePolyline(getRulerAbsolutePoints(), "#0ea5e9", true);
     if (rulerDragMode === "draw" && rulerDraftPoints && rulerDraftPoints.length > 1) {
-      drawRulerPolygon(rulerDraftPoints, false);
+      drawGuideLikePolyline(rulerDraftPoints, "#0ea5e9", false);
+    }
+  }
+
+  function getGuideAbsolutePoints() {
+    if (!guide) return [];
+    return guide.points.map((p) => ({ x_px: p.x_px + guide.offsetX, y_px: p.y_px + guide.offsetY }));
+  }
+
+  function isNearGuide(xPx, yPx) {
+    if (!guide) return false;
+    const abs = getGuideAbsolutePoints();
+    const best = closestPointOnPolyline(xPx, yPx, abs, false);
+    return best && Math.sqrt(best.dist2) < GUIDE_DRAG_THRESHOLD;
+  }
+
+  function drawGuideOverlay() {
+    if (guide) drawGuideLikePolyline(getGuideAbsolutePoints(), "#16a34a", false);
+    if (guideDragMode === "draw" && guideDraftPoints && guideDraftPoints.length > 1) {
+      drawGuideLikePolyline(guideDraftPoints, "#16a34a", false);
     }
   }
 
@@ -744,7 +790,9 @@
     playBtn.disabled = editing;
     modeDrawBtn.disabled = editing;
     modeRulerBtn.disabled = editing;
+    modeGuideBtn.disabled = editing;
     rulerClearBtn.disabled = editing;
+    guideClearBtn.disabled = editing;
     updateFamilyUI();
   }
 
@@ -912,17 +960,68 @@
     redrawAll();
   }
 
-  // モードに応じて描画用/ルーラー用のハンドラに振り分ける
+  // ------------------------------------------------------------------
+  // ガイドモード用のポインタ処理（形の描画・移動。ルーラーと違い描画は一切ブロックしない）
+  // ------------------------------------------------------------------
+  function onGuidePointerDown(evt) {
+    if (isPlaying) return;
+    if (guideDragPointerId !== null) return;
+    evt.preventDefault();
+    canvas.setPointerCapture(evt.pointerId);
+    guideDragPointerId = evt.pointerId;
+    const [xPx, yPx] = getLocalPos(evt);
+
+    if (isNearGuide(xPx, yPx)) {
+      guideDragMode = "move";
+      guideDragStart = { x: xPx, y: yPx };
+      guideOffsetStart = { x: guide.offsetX, y: guide.offsetY };
+    } else {
+      guideDragMode = "draw";
+      guideDraftPoints = [{ x_px: xPx, y_px: yPx }];
+    }
+    redrawAll();
+  }
+
+  function onGuidePointerMove(evt) {
+    if (guideDragPointerId !== evt.pointerId) return;
+    evt.preventDefault();
+    const [xPx, yPx] = getLocalPos(evt);
+
+    if (guideDragMode === "move") {
+      guide.offsetX = guideOffsetStart.x + (xPx - guideDragStart.x);
+      guide.offsetY = guideOffsetStart.y + (yPx - guideDragStart.y);
+    } else if (guideDragMode === "draw") {
+      guideDraftPoints.push({ x_px: xPx, y_px: yPx });
+    }
+    redrawAll();
+  }
+
+  function onGuidePointerUp(evt) {
+    if (guideDragPointerId !== evt.pointerId) return;
+    if (guideDragMode === "draw" && guideDraftPoints && guideDraftPoints.length > 1) {
+      guide = { points: guideDraftPoints, offsetX: 0, offsetY: 0 };
+      log("ガイドの形を更新しました");
+    }
+    guideDragPointerId = null;
+    guideDragMode = null;
+    guideDraftPoints = null;
+    redrawAll();
+  }
+
+  // モードに応じて描画用/ルーラー用/ガイド用のハンドラに振り分ける
   function handlePointerDown(evt) {
     if (mode === "ruler") onRulerPointerDown(evt);
+    else if (mode === "guide") onGuidePointerDown(evt);
     else onPointerDown(evt);
   }
   function handlePointerMove(evt) {
     if (mode === "ruler") onRulerPointerMove(evt);
+    else if (mode === "guide") onGuidePointerMove(evt);
     else onPointerMove(evt);
   }
   function handlePointerUp(evt) {
     if (mode === "ruler") onRulerPointerUp(evt);
+    else if (mode === "guide") onGuidePointerUp(evt);
     else endStroke(evt);
   }
 
@@ -933,6 +1032,7 @@
   canvas.addEventListener("pointerleave", (evt) => {
     // Pencilがcanvas外に出て離された場合もストロークを閉じる
     if (mode === "ruler") { if (rulerDragPointerId === evt.pointerId) onRulerPointerUp(evt); }
+    else if (mode === "guide") { if (guideDragPointerId === evt.pointerId) onGuidePointerUp(evt); }
     else if (activePointerId === evt.pointerId) endStroke(evt);
   }, { passive: false });
 
@@ -962,23 +1062,35 @@
   editConfirmBtn.addEventListener("click", confirmEdit);
   editCancelBtn.addEventListener("click", cancelEdit);
 
+  const MODE_LOG = {
+    draw: "描画モードに切り替えました",
+    ruler: "ルーラーモードに切り替えました（外側で形を描く/内側を触って移動、内側には描画できません）",
+    guide: "ガイドモードに切り替えました（外側で形を描く/近くを触って移動、描画はブロックしません）",
+  };
   function setMode(newMode) {
     if (isPlaying || editingId !== null) return; // 再生中・編集中はモード変更不可
     mode = newMode;
     modeDrawBtn.classList.toggle("active", mode === "draw");
     modeRulerBtn.classList.toggle("active", mode === "ruler");
+    modeGuideBtn.classList.toggle("active", mode === "guide");
     wrap.classList.toggle("ruler-mode", mode === "ruler");
-    log(mode === "draw"
-      ? "描画モードに切り替えました"
-      : "ルーラーモードに切り替えました（外側で形を描く/内側を触って移動できます）");
+    wrap.classList.toggle("guide-mode", mode === "guide");
+    log(MODE_LOG[mode]);
   }
   modeDrawBtn.addEventListener("click", () => setMode("draw"));
   modeRulerBtn.addEventListener("click", () => setMode("ruler"));
+  modeGuideBtn.addEventListener("click", () => setMode("guide"));
   rulerClearBtn.addEventListener("click", () => {
     if (isPlaying || editingId !== null) return;
     ruler = null;
     redrawAll();
     log("ルーラーを削除しました");
+  });
+  guideClearBtn.addEventListener("click", () => {
+    if (isPlaying || editingId !== null) return;
+    guide = null;
+    redrawAll();
+    log("ガイドを削除しました");
   });
 
   function sleep(ms) {
@@ -995,7 +1107,9 @@
     editCancelBtn.disabled = !enabled;
     modeDrawBtn.disabled = !enabled;
     modeRulerBtn.disabled = !enabled;
+    modeGuideBtn.disabled = !enabled;
     rulerClearBtn.disabled = !enabled;
+    guideClearBtn.disabled = !enabled;
   }
 
   // 記録した実際のタイムスタンプ間隔どおりに再生し、キャプチャした軌跡の
