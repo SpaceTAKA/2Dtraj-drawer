@@ -480,6 +480,29 @@
     return pointInPolygon(xPx, yPx, getRulerAbsolutePoints());
   }
 
+  function closestPointOnSegment(px, py, ax, ay, bx, by) {
+    const abx = bx - ax, aby = by - ay;
+    const lenSq = abx * abx + aby * aby;
+    let t = lenSq > 0 ? ((px - ax) * abx + (py - ay) * aby) / lenSq : 0;
+    t = Math.max(0, Math.min(1, t));
+    const x = ax + t * abx, y = ay + t * aby;
+    const dx = px - x, dy = py - y;
+    return { x, y, dist2: dx * dx + dy * dy };
+  }
+
+  // ルーラーの縁（各辺のうち最も近い1点）に点を吸着させる。実物の定規のように
+  // 「縁に沿ってなぞる」動きを再現するため、内側に入った点はここに丸め込む。
+  function clampToRulerBoundary(xPx, yPx) {
+    const abs = getRulerAbsolutePoints();
+    let best = null;
+    for (let i = 0; i < abs.length; i++) {
+      const a = abs[i], b = abs[(i + 1) % abs.length];
+      const c = closestPointOnSegment(xPx, yPx, a.x_px, a.y_px, b.x_px, b.y_px);
+      if (!best || c.dist2 < best.dist2) best = c;
+    }
+    return best ? [best.x, best.y] : [xPx, yPx];
+  }
+
   function drawRulerPolygon(points, closeAndFill) {
     if (points.length < 2) return;
     ctx.save();
@@ -559,21 +582,16 @@
       : [evt];
 
     for (const e of (events.length ? events : [evt])) {
-      const [xPx, yPx] = getLocalPos(e);
+      let [xPx, yPx] = getLocalPos(e);
 
+      // 本物の定規のように、内側に入ろうとした点は縁に吸着させて
+      // なぞり続けられるようにする（ストロークは分割しない）。
       if (isInsideRuler(xPx, yPx)) {
-        // ルーラーの内側: ステンシルのように描けない。今の下書きはここで確定し、
-        // 外に出たら新しいストロークとして再開する（継ぎ目のワープを作らないため）。
-        if (currentStroke && currentStroke.points.length > 1) {
-          strokes.push(currentStroke);
-          updateCounts();
-        }
-        currentStroke = null;
-        continue;
+        [xPx, yPx] = clampToRulerBoundary(xPx, yPx);
       }
 
       if (!currentStroke) {
-        // ルーラーの外に出た（またはこのmoveが最初の点）: 新しいストロークとして再開
+        // 何らかの理由でcurrentStrokeが無い場合の保険として、ここから再開する
         currentStroke = { index: strokes.length, pointerType: e.pointerType, points: [makePoint(e, xPx, yPx)] };
         continue;
       }
