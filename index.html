@@ -52,6 +52,27 @@
     font-size: 14px;
     width: 200px;
   }
+  .mode-row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .mode-btn {
+    padding: 8px 14px;
+    font-size: 13px;
+    font-weight: 700;
+    border: 2px solid transparent;
+    border-radius: 10px;
+    cursor: pointer;
+    color: #374151;
+    background: #e5e7eb;
+  }
+  .mode-btn.active {
+    color: #fff;
+    background: #0ea5e9;
+    border-color: #0369a1;
+  }
   #canvasWrap {
     position: relative;
     width: var(--canvas-size);
@@ -61,6 +82,10 @@
     border-radius: 12px;
     touch-action: none;
     overflow: hidden;
+    transition: border-color 0.15s;
+  }
+  #canvasWrap.ruler-mode {
+    border-color: #0ea5e9;
   }
   #drawCanvas {
     position: absolute;
@@ -208,6 +233,12 @@
     <input id="labelInput" type="text" placeholder="ラベル / セッションID（任意）">
   </div>
 
+  <div class="mode-row">
+    <button id="modeDrawBtn" class="mode-btn active">✏️ 描画モード</button>
+    <button id="modeRulerBtn" class="mode-btn">📐 ルーラーモード</button>
+    <button id="rulerClearBtn" class="secondary">ルーラー削除</button>
+  </div>
+
   <div id="canvasWrap">
     <canvas id="drawCanvas"></canvas>
     <div id="recBadge"><span class="dot"></span>REC</div>
@@ -266,6 +297,9 @@
   const familyCountEl = document.getElementById("familyCount");
   const familyTimestepsEl = document.getElementById("familyTimesteps");
   const familyListEl = document.getElementById("familyList");
+  const modeDrawBtn = document.getElementById("modeDrawBtn");
+  const modeRulerBtn = document.getElementById("modeRulerBtn");
+  const rulerClearBtn = document.getElementById("rulerClearBtn");
 
   let cssSize = 0;       // CSS上のキャンバス一辺の長さ(px)
   let dpr = window.devicePixelRatio || 1;
@@ -285,6 +319,18 @@
   let familyIdCounter = 0;
   let editingId = null;       // 編集中のFamilyメンバーのid（null = 編集中でない）
   let editingOriginal = null; // キャンセル時に復元するための編集前スナップショット {id,color,pointerType,points,listIndex}
+
+  // ------------------------------------------------------------------
+  // ルーラー（ステンシルのように、自分で描いた形の"内側"には描画できない
+  // 移動可能なガイド）。記録データ(t,x,y)には一切含まれない、あくまでUI上のガイド。
+  // ------------------------------------------------------------------
+  let mode = "draw"; // "draw" | "ruler"
+  let ruler = null;  // { points: [{x_px,y_px}, ...], offsetX, offsetY } | null
+  let rulerDragPointerId = null;
+  let rulerDragMode = null;      // "move" | "draw"
+  let rulerDraftPoints = null;   // ルーラーの形を新規に描いている間の一時点列
+  let rulerDragStart = null;     // {x,y} 移動開始時のポインタ位置
+  let rulerOffsetStart = null;   // {x,y} 移動開始時のruler.offset
 
   function log(msg) {
     const t = new Date().toLocaleTimeString();
@@ -404,6 +450,59 @@
     for (const s of strokes) {
       drawPolyline(s.points, "#111827", 1);
     }
+    drawRulerOverlay(); // ルーラーは一番上に重ねて、どこが描けないか常に見えるようにする
+  }
+
+  // ------------------------------------------------------------------
+  // ルーラー: 内側判定・描画・移動
+  // ------------------------------------------------------------------
+
+  // レイキャスト法による点内外判定。pointsは絶対ピクセル座標(x_px,y_px)の配列。
+  function pointInPolygon(x, y, points) {
+    let inside = false;
+    for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+      const xi = points[i].x_px, yi = points[i].y_px;
+      const xj = points[j].x_px, yj = points[j].y_px;
+      const intersect = (yi > y) !== (yj > y) &&
+        x < ((xj - xi) * (y - yi)) / (yj - yi) + xi;
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  function getRulerAbsolutePoints() {
+    if (!ruler) return [];
+    return ruler.points.map((p) => ({ x_px: p.x_px + ruler.offsetX, y_px: p.y_px + ruler.offsetY }));
+  }
+
+  function isInsideRuler(xPx, yPx) {
+    if (!ruler) return false;
+    return pointInPolygon(xPx, yPx, getRulerAbsolutePoints());
+  }
+
+  function drawRulerPolygon(points, closeAndFill) {
+    if (points.length < 2) return;
+    ctx.save();
+    ctx.setLineDash([6, 4]);
+    ctx.strokeStyle = "#0ea5e9";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(points[0].x_px, points[0].y_px);
+    for (let i = 1; i < points.length; i++) ctx.lineTo(points[i].x_px, points[i].y_px);
+    if (closeAndFill) {
+      ctx.closePath();
+      ctx.fillStyle = "rgba(14,165,233,0.15)";
+      ctx.fill();
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawRulerOverlay() {
+    if (ruler) drawRulerPolygon(getRulerAbsolutePoints(), true);
+    if (rulerDragMode === "draw" && rulerDraftPoints && rulerDraftPoints.length > 1) {
+      drawRulerPolygon(rulerDraftPoints, false);
+    }
   }
 
   // ------------------------------------------------------------------
@@ -429,13 +528,15 @@
   function onPointerDown(evt) {
     if (isPlaying) return;              // 再生中はペン入力を無視
     if (activePointerId !== null) return; // 同時多点は無視（1本ずつ記録）
+    const [xPx, yPx] = getLocalPos(evt);
+    if (isInsideRuler(xPx, yPx)) return; // ルーラーの内側にはペンを置けない（ステンシル）
+
     evt.preventDefault();
     canvas.setPointerCapture(evt.pointerId);
     activePointerId = evt.pointerId;
     recBadge.classList.add("on");        // ペンが触れた瞬間に録画開始を表示
     strokeStartPerf = performance.now();
 
-    const [xPx, yPx] = getLocalPos(evt);
     currentStroke = {
       index: strokes.length,
       pointerType: evt.pointerType, // "pen" / "touch" / "mouse"
@@ -449,7 +550,7 @@
   }
 
   function onPointerMove(evt) {
-    if (activePointerId !== evt.pointerId || !currentStroke) return;
+    if (activePointerId !== evt.pointerId) return;
     evt.preventDefault();
 
     // coalesced events が使えるブラウザなら、間引かれる前の点も拾う
@@ -459,6 +560,24 @@
 
     for (const e of (events.length ? events : [evt])) {
       const [xPx, yPx] = getLocalPos(e);
+
+      if (isInsideRuler(xPx, yPx)) {
+        // ルーラーの内側: ステンシルのように描けない。今の下書きはここで確定し、
+        // 外に出たら新しいストロークとして再開する（継ぎ目のワープを作らないため）。
+        if (currentStroke && currentStroke.points.length > 1) {
+          strokes.push(currentStroke);
+          updateCounts();
+        }
+        currentStroke = null;
+        continue;
+      }
+
+      if (!currentStroke) {
+        // ルーラーの外に出た（またはこのmoveが最初の点）: 新しいストロークとして再開
+        currentStroke = { index: strokes.length, pointerType: e.pointerType, points: [makePoint(e, xPx, yPx)] };
+        continue;
+      }
+
       const prev = currentStroke.points[currentStroke.points.length - 1];
       currentStroke.points.push(makePoint(e, xPx, yPx));
       drawSegment([prev.x_px, prev.y_px], [xPx, yPx]);
@@ -605,6 +724,9 @@
     editBanner.textContent = editing ? "編集中… 完了するまで他のSeqの編集・削除・書き出しはできません" : "";
     exportBtn.disabled = editing;
     playBtn.disabled = editing;
+    modeDrawBtn.disabled = editing;
+    modeRulerBtn.disabled = editing;
+    rulerClearBtn.disabled = editing;
     updateFamilyUI();
   }
 
@@ -706,26 +828,94 @@
   // リアルタイムに更新し続けるループ。pointermoveの発火頻度に依存させないよう
   // requestAnimationFrameで独立に回す。
   function tickLiveStats() {
-    if (activePointerId === null || !currentStroke) {
+    // activePointerId自体は、ルーラーをまたいで一時的にcurrentStrokeがnullになっても
+    // ペンが離れるまで維持されるので、ここではそれだけを終了条件にする。
+    if (activePointerId === null) {
       liveTickRunning = false;
       return;
     }
     const elapsedSec = (performance.now() - strokeStartPerf) / 1000;
     statusElapsed.textContent = elapsedSec.toFixed(2);
+    statusStrokeCount.textContent = strokes.length;
 
     const confirmedPoints = strokes.reduce((acc, s) => acc + s.points.length, 0);
-    statusPointCount.textContent = confirmedPoints + currentStroke.points.length;
+    statusPointCount.textContent = confirmedPoints + (currentStroke ? currentStroke.points.length : 0);
 
     requestAnimationFrame(tickLiveStats);
   }
 
-  canvas.addEventListener("pointerdown", onPointerDown, { passive: false });
-  canvas.addEventListener("pointermove", onPointerMove, { passive: false });
-  canvas.addEventListener("pointerup", endStroke, { passive: false });
-  canvas.addEventListener("pointercancel", endStroke, { passive: false });
+  // ------------------------------------------------------------------
+  // ルーラーモード用のポインタ処理（形の描画・移動）
+  // ------------------------------------------------------------------
+  function onRulerPointerDown(evt) {
+    if (isPlaying) return;
+    if (rulerDragPointerId !== null) return;
+    evt.preventDefault();
+    canvas.setPointerCapture(evt.pointerId);
+    rulerDragPointerId = evt.pointerId;
+    const [xPx, yPx] = getLocalPos(evt);
+
+    if (isInsideRuler(xPx, yPx)) {
+      // ルーラーの内側を触った: そのまま動かす(移動)モード
+      rulerDragMode = "move";
+      rulerDragStart = { x: xPx, y: yPx };
+      rulerOffsetStart = { x: ruler.offsetX, y: ruler.offsetY };
+    } else {
+      // ルーラーの外を触った: 新しい形を描き直す(既存のルーラーは確定時に置き換わる)
+      rulerDragMode = "draw";
+      rulerDraftPoints = [{ x_px: xPx, y_px: yPx }];
+    }
+    redrawAll();
+  }
+
+  function onRulerPointerMove(evt) {
+    if (rulerDragPointerId !== evt.pointerId) return;
+    evt.preventDefault();
+    const [xPx, yPx] = getLocalPos(evt);
+
+    if (rulerDragMode === "move") {
+      ruler.offsetX = rulerOffsetStart.x + (xPx - rulerDragStart.x);
+      ruler.offsetY = rulerOffsetStart.y + (yPx - rulerDragStart.y);
+    } else if (rulerDragMode === "draw") {
+      rulerDraftPoints.push({ x_px: xPx, y_px: yPx });
+    }
+    redrawAll();
+  }
+
+  function onRulerPointerUp(evt) {
+    if (rulerDragPointerId !== evt.pointerId) return;
+    if (rulerDragMode === "draw" && rulerDraftPoints && rulerDraftPoints.length > 2) {
+      ruler = { points: rulerDraftPoints, offsetX: 0, offsetY: 0 };
+      log("ルーラーの形を更新しました");
+    }
+    rulerDragPointerId = null;
+    rulerDragMode = null;
+    rulerDraftPoints = null;
+    redrawAll();
+  }
+
+  // モードに応じて描画用/ルーラー用のハンドラに振り分ける
+  function handlePointerDown(evt) {
+    if (mode === "ruler") onRulerPointerDown(evt);
+    else onPointerDown(evt);
+  }
+  function handlePointerMove(evt) {
+    if (mode === "ruler") onRulerPointerMove(evt);
+    else onPointerMove(evt);
+  }
+  function handlePointerUp(evt) {
+    if (mode === "ruler") onRulerPointerUp(evt);
+    else endStroke(evt);
+  }
+
+  canvas.addEventListener("pointerdown", handlePointerDown, { passive: false });
+  canvas.addEventListener("pointermove", handlePointerMove, { passive: false });
+  canvas.addEventListener("pointerup", handlePointerUp, { passive: false });
+  canvas.addEventListener("pointercancel", handlePointerUp, { passive: false });
   canvas.addEventListener("pointerleave", (evt) => {
     // Pencilがcanvas外に出て離された場合もストロークを閉じる
-    if (activePointerId === evt.pointerId) endStroke(evt);
+    if (mode === "ruler") { if (rulerDragPointerId === evt.pointerId) onRulerPointerUp(evt); }
+    else if (activePointerId === evt.pointerId) endStroke(evt);
   }, { passive: false });
 
   // Safariでのスクロール・ダブルタップズーム・スクリブル干渉を抑止
@@ -754,6 +944,25 @@
   editConfirmBtn.addEventListener("click", confirmEdit);
   editCancelBtn.addEventListener("click", cancelEdit);
 
+  function setMode(newMode) {
+    if (isPlaying || editingId !== null) return; // 再生中・編集中はモード変更不可
+    mode = newMode;
+    modeDrawBtn.classList.toggle("active", mode === "draw");
+    modeRulerBtn.classList.toggle("active", mode === "ruler");
+    wrap.classList.toggle("ruler-mode", mode === "ruler");
+    log(mode === "draw"
+      ? "描画モードに切り替えました"
+      : "ルーラーモードに切り替えました（外側で形を描く/内側を触って移動できます）");
+  }
+  modeDrawBtn.addEventListener("click", () => setMode("draw"));
+  modeRulerBtn.addEventListener("click", () => setMode("ruler"));
+  rulerClearBtn.addEventListener("click", () => {
+    if (isPlaying || editingId !== null) return;
+    ruler = null;
+    redrawAll();
+    log("ルーラーを削除しました");
+  });
+
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
@@ -766,6 +975,9 @@
     playBtn.disabled = !enabled;
     editConfirmBtn.disabled = !enabled;
     editCancelBtn.disabled = !enabled;
+    modeDrawBtn.disabled = !enabled;
+    modeRulerBtn.disabled = !enabled;
+    rulerClearBtn.disabled = !enabled;
   }
 
   // 記録した実際のタイムスタンプ間隔どおりに再生し、キャプチャした軌跡の
