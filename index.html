@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>軌跡データ収集 (RNN学習用)</title>
+<style>
+  :root {
+    --canvas-size: min(90vw, 90vh, 700px);
+    --accent: #2563eb;
+    --danger: #dc2626;
+    --ink: #111827;
+    --muted: #6b7280;
+    --bg: #f3f4f6;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg);
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic", sans-serif;
+    color: var(--ink);
+    /* iPadでのスクロール・バウンス・Pencilでのスクリブル干渉を防ぐ */
+    overscroll-behavior: none;
+    touch-action: none;
+  }
+  .app {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    padding: 16px;
+    min-height: 100%;
+  }
+  h1 {
+    font-size: 16px;
+    font-weight: 600;
+    margin: 4px 0 0;
+    color: var(--muted);
+  }
+  .meta-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .meta-row input[type="text"] {
+    padding: 8px 10px;
+    border: 1px solid #d1d5db;
+    border-radius: 8px;
+    font-size: 14px;
+    width: 200px;
+  }
+  #canvasWrap {
+    position: relative;
+    width: var(--canvas-size);
+    height: var(--canvas-size);
+    background: #ffffff;
+    border: 2px solid #111827;
+    border-radius: 12px;
+    touch-action: none;
+    overflow: hidden;
+  }
+  #drawCanvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+    display: block;
+  }
+  .controls {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  button {
+    padding: 10px 18px;
+    font-size: 14px;
+    font-weight: 600;
+    border: none;
+    border-radius: 10px;
+    cursor: pointer;
+    color: white;
+    background: var(--accent);
+  }
+  button.secondary { background: #4b5563; }
+  button.danger { background: var(--danger); }
+  button:active { opacity: 0.8; }
+  #status {
+    font-size: 13px;
+    color: var(--muted);
+    text-align: center;
+    min-height: 18px;
+  }
+  #log {
+    width: var(--canvas-size);
+    max-width: 100%;
+    font-size: 11px;
+    color: var(--muted);
+    white-space: pre-wrap;
+    text-align: left;
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>軌跡データ収集ツール（研究用 / RNN学習データ作成）</h1>
+
+  <div class="meta-row">
+    <input id="labelInput" type="text" placeholder="ラベル / セッションID（任意）">
+  </div>
+
+  <div id="canvasWrap">
+    <canvas id="drawCanvas"></canvas>
+  </div>
+
+  <div id="status">ストローク数: <span id="strokeCount">0</span> / 総点数: <span id="pointCount">0</span></div>
+
+  <div class="controls">
+    <button id="undoBtn" class="secondary">元に戻す</button>
+    <button id="clearBtn" class="danger">全消去</button>
+    <button id="saveBtn">JSONを保存</button>
+  </div>
+
+  <div id="log"></div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ------------------------------------------------------------------
+  // 設定値
+  // ------------------------------------------------------------------
+  const TARGET_RANGE = 0.9; // tanh飽和を避けるため ±0.9 に収める
+  const MAX_POINTS_PER_FRAME_LOG = false;
+
+  const canvas = document.getElementById("drawCanvas");
+  const ctx = canvas.getContext("2d", { desynchronized: true });
+  const wrap = document.getElementById("canvasWrap");
+  const statusStrokeCount = document.getElementById("strokeCount");
+  const statusPointCount = document.getElementById("pointCount");
+  const logEl = document.getElementById("log");
+  const labelInput = document.getElementById("labelInput");
+
+  let cssSize = 0;       // CSS上のキャンバス一辺の長さ(px)
+  let dpr = window.devicePixelRatio || 1;
+
+  // 記録データ本体: strokes = [ {pointerType, points: [...]} , ... ]
+  let strokes = [];
+  let currentStroke = null;
+  let activePointerId = null;
+
+  function log(msg) {
+    const t = new Date().toLocaleTimeString();
+    logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent;
+  }
+
+  // ------------------------------------------------------------------
+  // キャンバスのセットアップ（正方形・原点中心の座標系を固定するため）
+  // ------------------------------------------------------------------
+  function resizeCanvas() {
+    const rect = wrap.getBoundingClientRect();
+    cssSize = rect.width; // wrapは正方形なのでwidth=height
+    dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(cssSize * dpr);
+    canvas.height = Math.round(cssSize * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    redrawAll();
+  }
+  window.addEventListener("resize", resizeCanvas);
+
+  // ------------------------------------------------------------------
+  // 正規化: キャンバスの描画可能範囲(正方形・原点中心)を [-0.9, 0.9] に写す
+  // これによりデータセット全体のmin/maxに依存しない「既知の固定変換」になる。
+  // y軸は画面下向き正 -> 数学的な上向き正に反転しておく。
+  // ------------------------------------------------------------------
+  function toNormalized(xPx, yPx) {
+    const half = cssSize / 2;
+    let xNorm = ((xPx - half) / half) * TARGET_RANGE;
+    let yNorm = -((yPx - half) / half) * TARGET_RANGE;
+    // 境界丸め誤差対策のclamp
+    xNorm = Math.max(-1, Math.min(1, xNorm));
+    yNorm = Math.max(-1, Math.min(1, yNorm));
+    return [xNorm, yNorm];
+  }
+
+  function getLocalPos(evt) {
+    const rect = canvas.getBoundingClientRect();
+    return [evt.clientX - rect.left, evt.clientY - rect.top];
+  }
+
+  // ------------------------------------------------------------------
+  // 描画（見た目のフィードバック用。記録データとは独立）
+  // ------------------------------------------------------------------
+  function drawSegment(p0, p1) {
+    ctx.strokeStyle = "#111827";
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    ctx.moveTo(p0[0], p0[1]);
+    ctx.lineTo(p1[0], p1[1]);
+    ctx.stroke();
+  }
+
+  function redrawAll() {
+    ctx.clearRect(0, 0, cssSize, cssSize);
+    // 中心の目印（デバッグ用の薄いガイド）
+    ctx.save();
+    ctx.strokeStyle = "#e5e7eb";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(cssSize / 2, 0); ctx.lineTo(cssSize / 2, cssSize);
+    ctx.moveTo(0, cssSize / 2); ctx.lineTo(cssSize, cssSize / 2);
+    ctx.stroke();
+    ctx.restore();
+
+    for (const s of strokes) {
+      for (let i = 1; i < s.points.length; i++) {
+        drawSegment([s.points[i - 1].x_px, s.points[i - 1].y_px],
+                    [s.points[i].x_px, s.points[i].y_px]);
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // ポインタイベント（Apple Pencil / 指 / マウス）
+  // ------------------------------------------------------------------
+  function makePoint(evt, xPx, yPx) {
+    const [xNorm, yNorm] = toNormalized(xPx, yPx);
+    const point = {
+      t: evt.timeStamp,           // DOMHighResTimeStamp (ms, 単調増加, 高分解能)
+      x: xNorm,                   // 正規化済み [-0.9, 0.9] (主データ)
+      y: yNorm,
+      x_px: xPx,                  // 生のキャンバス内ピクセル座標（デバッグ・再変換用）
+      y_px: yPx,
+      pressure: evt.pressure ?? 0,
+    };
+    if (typeof evt.tiltX === "number") point.tiltX = evt.tiltX;
+    if (typeof evt.tiltY === "number") point.tiltY = evt.tiltY;
+    if (typeof evt.altitudeAngle === "number") point.altitudeAngle = evt.altitudeAngle;
+    if (typeof evt.azimuthAngle === "number") point.azimuthAngle = evt.azimuthAngle;
+    return point;
+  }
+
+  function onPointerDown(evt) {
+    if (activePointerId !== null) return; // 同時多点は無視（1本ずつ記録）
+    evt.preventDefault();
+    canvas.setPointerCapture(evt.pointerId);
+    activePointerId = evt.pointerId;
+
+    const [xPx, yPx] = getLocalPos(evt);
+    currentStroke = {
+      index: strokes.length,
+      pointerType: evt.pointerType, // "pen" / "touch" / "mouse"
+      points: [makePoint(evt, xPx, yPx)],
+    };
+  }
+
+  function onPointerMove(evt) {
+    if (activePointerId !== evt.pointerId || !currentStroke) return;
+    evt.preventDefault();
+
+    // coalesced events が使えるブラウザなら、間引かれる前の点も拾う
+    const events = (typeof evt.getCoalescedEvents === "function")
+      ? evt.getCoalescedEvents()
+      : [evt];
+
+    for (const e of (events.length ? events : [evt])) {
+      const [xPx, yPx] = getLocalPos(e);
+      const prev = currentStroke.points[currentStroke.points.length - 1];
+      currentStroke.points.push(makePoint(e, xPx, yPx));
+      drawSegment([prev.x_px, prev.y_px], [xPx, yPx]);
+    }
+  }
+
+  function endStroke(evt) {
+    if (activePointerId !== evt.pointerId) return;
+    if (currentStroke && currentStroke.points.length > 1) {
+      strokes.push(currentStroke);
+    }
+    currentStroke = null;
+    activePointerId = null;
+    updateCounts();
+  }
+
+  function updateCounts() {
+    statusStrokeCount.textContent = strokes.length;
+    const totalPoints = strokes.reduce((acc, s) => acc + s.points.length, 0);
+    statusPointCount.textContent = totalPoints;
+  }
+
+  canvas.addEventListener("pointerdown", onPointerDown, { passive: false });
+  canvas.addEventListener("pointermove", onPointerMove, { passive: false });
+  canvas.addEventListener("pointerup", endStroke, { passive: false });
+  canvas.addEventListener("pointercancel", endStroke, { passive: false });
+  canvas.addEventListener("pointerleave", (evt) => {
+    // Pencilがcanvas外に出て離された場合もストロークを閉じる
+    if (activePointerId === evt.pointerId) endStroke(evt);
+  }, { passive: false });
+
+  // Safariでのスクロール・ダブルタップズーム・スクリブル干渉を抑止
+  canvas.addEventListener("touchstart", (e) => e.preventDefault(), { passive: false });
+  canvas.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
+  document.addEventListener("gesturestart", (e) => e.preventDefault());
+
+  // ------------------------------------------------------------------
+  // 操作ボタン
+  // ------------------------------------------------------------------
+  document.getElementById("undoBtn").addEventListener("click", () => {
+    strokes.pop();
+    redrawAll();
+    updateCounts();
+    log("直前のストロークを取り消しました");
+  });
+
+  document.getElementById("clearBtn").addEventListener("click", () => {
+    strokes = [];
+    redrawAll();
+    updateCounts();
+    log("全ストロークを消去しました");
+  });
+
+  document.getElementById("saveBtn").addEventListener("click", () => {
+    if (strokes.length === 0) {
+      log("保存する軌跡がありません");
+      return;
+    }
+    const payload = {
+      meta: {
+        app: "ipad-trajectory-capture",
+        version: 1,
+        recordedAt: new Date().toISOString(),
+        label: labelInput.value || null,
+        canvas: { size_px: cssSize, dpr: dpr },
+        normalization: {
+          target_range: [-TARGET_RANGE, TARGET_RANGE],
+          x_formula: "x = (x_px - size/2) / (size/2) * 0.9",
+          y_formula: "y = -(y_px - size/2) / (size/2) * 0.9  (画面下向きを反転し上向き正に)",
+        },
+        time: {
+          unit: "ms",
+          clock: "PointerEvent.timeStamp (performance.now()系, 単調増加の高分解能タイムスタンプ)",
+          sampling: "native (未リサンプリング)。固定Hzへの変換は前処理スクリプト側で実施する想定。",
+        },
+      },
+      strokes: strokes,
+    };
+    const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const stamp = payload.meta.recordedAt.replace(/[:.]/g, "-");
+    a.href = url;
+    a.download = `trajectory_${stamp}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    log(`保存しました: ${strokes.length}ストローク`);
+  });
+
+  // ------------------------------------------------------------------
+  // 初期化
+  // ------------------------------------------------------------------
+  resizeCanvas();
+  updateCounts();
+  log("準備完了。Apple Pencilで描いてください。");
+})();
+</script>
+</body>
+</html>
