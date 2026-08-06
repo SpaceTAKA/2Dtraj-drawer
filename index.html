@@ -143,7 +143,7 @@
     <div id="recBadge"><span class="dot"></span>REC</div>
   </div>
 
-  <div id="status">ストローク数: <span id="strokeCount">0</span> / 総点数: <span id="pointCount">0</span></div>
+  <div id="status">Strokes: <span id="strokeCount">0</span> &nbsp;|&nbsp; Timesteps: <span id="pointCount">0</span> &nbsp;|&nbsp; Elapsed: <span id="elapsed">0.00</span>s</div>
 
   <div class="controls">
     <button id="undoBtn" class="secondary">元に戻す</button>
@@ -170,6 +170,7 @@
   const wrap = document.getElementById("canvasWrap");
   const statusStrokeCount = document.getElementById("strokeCount");
   const statusPointCount = document.getElementById("pointCount");
+  const statusElapsed = document.getElementById("elapsed");
   const logEl = document.getElementById("log");
   const labelInput = document.getElementById("labelInput");
   const recBadge = document.getElementById("recBadge");
@@ -186,6 +187,8 @@
   let currentStroke = null;
   let activePointerId = null;
   let isPlaying = false; // 再生中は新規描画・他ボタンを無効化する
+  let strokeStartPerf = null; // 現在のストローク開始時刻(performance.now())
+  let liveTickRunning = false;  // 経過時間・timestepsのライブ更新ループが動いているか
 
   function log(msg) {
     const t = new Date().toLocaleTimeString();
@@ -316,6 +319,7 @@
     canvas.setPointerCapture(evt.pointerId);
     activePointerId = evt.pointerId;
     recBadge.classList.add("on");        // ペンが触れた瞬間に録画開始を表示
+    strokeStartPerf = performance.now();
 
     const [xPx, yPx] = getLocalPos(evt);
     currentStroke = {
@@ -323,6 +327,11 @@
       pointerType: evt.pointerType, // "pen" / "touch" / "mouse"
       points: [makePoint(evt, xPx, yPx)],
     };
+
+    if (!liveTickRunning) {
+      liveTickRunning = true;
+      requestAnimationFrame(tickLiveStats);
+    }
   }
 
   function onPointerMove(evt) {
@@ -357,6 +366,23 @@
     statusStrokeCount.textContent = strokes.length;
     const totalPoints = strokes.reduce((acc, s) => acc + s.points.length, 0);
     statusPointCount.textContent = totalPoints;
+  }
+
+  // レコーディング中（ペンが触れている間）、経過時間とtimesteps数を
+  // リアルタイムに更新し続けるループ。pointermoveの発火頻度に依存させないよう
+  // requestAnimationFrameで独立に回す。
+  function tickLiveStats() {
+    if (activePointerId === null || !currentStroke) {
+      liveTickRunning = false;
+      return;
+    }
+    const elapsedSec = (performance.now() - strokeStartPerf) / 1000;
+    statusElapsed.textContent = elapsedSec.toFixed(2);
+
+    const confirmedPoints = strokes.reduce((acc, s) => acc + s.points.length, 0);
+    statusPointCount.textContent = confirmedPoints + currentStroke.points.length;
+
+    requestAnimationFrame(tickLiveStats);
   }
 
   canvas.addEventListener("pointerdown", onPointerDown, { passive: false });
