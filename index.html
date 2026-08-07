@@ -298,10 +298,11 @@
     <div id="bermudaHeader">🌀 バミューダ設定（バミューダモードでキャンバスをタップ/ドラッグして位置を置く）</div>
     <div class="bermuda-controls">
       <label>R_balmuda <input id="bermudaRadiusInput" type="number" step="0.01" min="0.01" max="0.9" value="0.08"></label>
-      <label>μ (R_vanish) <input id="bermudaMuInput" type="number" step="0.01" value="0.10"></label>
+      <label>μ (R_vanish) <input id="bermudaMuInput" type="number" step="0.01" value="0"></label>
       <label>σ (R_vanish) <input id="bermudaSigmaInput" type="number" step="0.01" min="0" value="0.05"></label>
+      <label>ε (許容幅) <input id="bermudaEpsilonInput" type="number" step="0.005" min="0" value="0.02"></label>
     </div>
-    <div id="bermudaStats">Attempts: <span id="bmAttempts">0</span> &nbsp;|&nbsp; Reached: <span id="bmReached">0</span> &nbsp;|&nbsp; Vanished: <span id="bmVanished">0</span> &nbsp;|&nbsp; Success rate: <span id="bmRate">-</span></div>
+    <div id="bermudaStats">μ: <span id="bmMu">0</span> &nbsp;|&nbsp; Attempts: <span id="bmAttempts">0</span> &nbsp;|&nbsp; Reached: <span id="bmReached">0</span> &nbsp;|&nbsp; Vanished: <span id="bmVanished">0</span> &nbsp;|&nbsp; Success rate: <span id="bmRate">-</span></div>
   </div>
 
   <div class="controls">
@@ -365,6 +366,8 @@
   const bermudaRadiusInput = document.getElementById("bermudaRadiusInput");
   const bermudaMuInput = document.getElementById("bermudaMuInput");
   const bermudaSigmaInput = document.getElementById("bermudaSigmaInput");
+  const bermudaEpsilonInput = document.getElementById("bermudaEpsilonInput");
+  const bmMuEl = document.getElementById("bmMu");
   const bmAttemptsEl = document.getElementById("bmAttempts");
   const bmReachedEl = document.getElementById("bmReached");
   const bmVanishedEl = document.getElementById("bmVanished");
@@ -423,10 +426,15 @@
   let bermuda = null; // { cx, cy } (px, キャンバス内座標) | null = 未配置
   let bermudaDragPointerId = null;
   let bermudaStats = { attempts: 0, reached: 0, vanished: 0 };
-  let vanishedActive = false;          // 消失海域に入って以降、このジェスチャーの残りを無視するフラグ
+  // 消失海域に入って以降、このジェスチャーの間は座標を固定し続けるためのフラグと固定座標。
+  // (ペンが触れている間は録画を止めない。座標だけ「最後の座標」に固定して延長し続ける。)
+  let vanishedActive = false;
+  let vanishFreezeXPx = 0;
+  let vanishFreezeYPx = 0;
   let bermudaReachedThisGesture = false; // 今回のストロークでバミューダ本体に触れたか(統計用)
-  let currentRVanishNorm = 0; // 今回の試行でサンプリングされたR_vanish(正規化単位)
-  let currentRVanishPx = 0;   // 同上、px単位
+  let currentRVanishNorm = 0;   // 今回の試行でサンプリングされたR_vanish(正規化単位)
+  let currentRVanishPx = 0;     // 同上、px単位
+  let hasBermudaSample = false; // 一度でもサンプリングされたか(サンプリング済みリングを描くかどうか)
 
   function log(msg) {
     const t = new Date().toLocaleTimeString();
@@ -666,11 +674,17 @@
   // ------------------------------------------------------------------
 
   // 入力欄から現在のパラメータを都度読み取る(正規化単位)。
+  // epsilon: 「これより薄い消失海域は実質ゼロ(=踏み越えられる)」とみなす許容幅。
+  // R_vanishは折り返し正規分布(下の sampleGaussian の呼び出し側でabsを取る)なので
+  // 連続分布であり、ちょうど0になる確率は理論上ゼロ。そのため「実質ゼロ」を
+  // 判定するための有限の閾値が必要で、epsilonがその役割を持つ
+  // (muを0にしてσだけで到達率を作りたい場合、このepsilonが実質的な基準線になる)。
   function getBermudaParams() {
     return {
       rBalmuda: Math.max(0.001, parseFloat(bermudaRadiusInput.value) || 0),
       mu: parseFloat(bermudaMuInput.value) || 0,
       sigma: Math.max(0, parseFloat(bermudaSigmaInput.value) || 0),
+      epsilon: Math.max(0, parseFloat(bermudaEpsilonInput.value) || 0),
     };
   }
 
@@ -696,11 +710,34 @@
 
   // 消失海域(バミューダ本体の外側、半径 R_balmuda 〜 R_balmuda+R_vanish の輪) に
   // 入ったかどうか。rVanishPxはストローク開始時にサンプリングされた今回の試行値。
+  // R_vanishがepsilon未満(実質ゼロ、踏み越えられる幅)なら、輪自体が無いものとして
+  // 扱う(常にfalse) — これにより「たまにR_vanishが小さく出て、そのまま素通りで
+  // 核まで届く」という、sigmaが小さいほど届きやすくなる挙動が成立する。
   function isInsideVanishSea(xPx, yPx, rVanishPx) {
     if (!bermuda) return false;
-    const rCorePx = normToPx(getBermudaParams().rBalmuda);
+    const { rBalmuda, epsilon } = getBermudaParams();
+    if (rVanishPx < normToPx(epsilon)) return false;
+    const rCorePx = normToPx(rBalmuda);
     const d = bermudaDistPx(xPx, yPx);
     return d > rCorePx && d <= rCorePx + rVanishPx;
+  }
+
+  // 1点だけの内外判定だと、σが小さくて輪が薄い時や、ペンが速く動いた時に
+  // pointermoveのサンプル点が輪を「すり抜けて」しまい、本来なら消失するはずの
+  // 試行が(検出漏れで)バミューダまで届いてしまうことがある(トンネリング)。
+  // これを防ぐため、前回の記録点から今回の点までの「線分」がバミューダ中心から
+  // 半径R_balmuda+R_vanish以内に入るかどうかで判定する
+  // (=区間のどこかで消失海域の外周より内側に入っていれば、輪の厚みに関わらず
+  //  必ず一度は消失海域を通過している、という連続的な動きの前提に基づく)。
+  // R_vanishがepsilon未満の時は、上のisInsideVanishSeaと同様に「輪が無い」扱いにする。
+  function segmentEntersVanishSea(ax, ay, bx, by, rVanishPx) {
+    if (!bermuda) return false;
+    const { rBalmuda, epsilon } = getBermudaParams();
+    if (rVanishPx < normToPx(epsilon)) return false;
+    const rCorePx = normToPx(rBalmuda);
+    const rOuterPx = rCorePx + rVanishPx;
+    const c = closestPointOnSegment(bermuda.cx, bermuda.cy, ax, ay, bx, by);
+    return Math.sqrt(c.dist2) <= rOuterPx;
   }
 
   // ルーラーと同じ「縁に沿ってなぞる」挙動: バミューダ本体の境界に点を吸着させる
@@ -711,17 +748,59 @@
     return [bermuda.cx + (dx / d) * rPx, bermuda.cy + (dy / d) * rPx];
   }
 
-  // バミューダ本体(実線の円)だけを描く。消失海域の輪は意図的に描かない
-  // (sigmaの効果は「見えない危険」への到達率として、統計側で可視化する設計)。
+  // バミューダ本体(塗りつきの実線の円)、平均的な消失海域の外周(mu基準、常時表示)、
+  // 「実質ゼロ(=踏み越えられる)」とみなす許容幅epsilonの境界、
+  // 今回サンプリングされた実際の外周(currentRVanish基準、試行ごとに変わる・別の色)を描く。
+  // サンプル値のリングがepsilonのリングより内側に入っていれば、その試行は
+  // 「到達」になる、という今の到達判定がそのまま視覚的に読めるようにしている。
   function drawBermudaOverlay() {
     if (!bermuda) return;
-    const rPx = normToPx(getBermudaParams().rBalmuda);
+    const { rBalmuda, mu, epsilon } = getBermudaParams();
+    const rCorePx = normToPx(rBalmuda);
+
+    // 平均的な消失海域の外周 (mu基準。常時表示、σによる試行ごとのブレの「基準線」)
+    const muRingPx = rCorePx + normToPx(Math.max(0, mu));
+    ctx.save();
+    ctx.setLineDash([5, 5]);
+    ctx.strokeStyle = "#64748b";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(bermuda.cx, bermuda.cy, muRingPx, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+
+    // 「実質ゼロ」とみなすepsilonの境界(常時表示)。サンプル値のリングがこれより
+    // 内側に入っていれば「到達」、外側なら「消失」になる、という実際の判定基準そのもの。
+    const epsilonRingPx = rCorePx + normToPx(Math.max(0, epsilon));
+    ctx.save();
+    ctx.setLineDash([2, 6]);
+    ctx.strokeStyle = "#22c55e";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(bermuda.cx, bermuda.cy, epsilonRingPx, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+
+    // 今回サンプリングされたR_vanishによる実際の外周 (レコード開始ごとに再サンプリングされる)
+    if (hasBermudaSample) {
+      const sampledRingPx = rCorePx + currentRVanishPx;
+      ctx.save();
+      ctx.setLineDash([3, 3]);
+      ctx.strokeStyle = "#a855f7";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(bermuda.cx, bermuda.cy, sampledRingPx, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // バミューダ本体(実線の円)
     ctx.save();
     ctx.strokeStyle = "#f97316";
     ctx.fillStyle = "rgba(249,115,22,0.18)";
     ctx.lineWidth = 2.5;
     ctx.beginPath();
-    ctx.arc(bermuda.cx, bermuda.cy, rPx, 0, Math.PI * 2);
+    ctx.arc(bermuda.cx, bermuda.cy, rCorePx, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
     ctx.beginPath();
@@ -732,6 +811,7 @@
   }
 
   function updateBermudaStatsUI() {
+    bmMuEl.textContent = getBermudaParams().mu.toFixed(3);
     bmAttemptsEl.textContent = bermudaStats.attempts;
     bmReachedEl.textContent = bermudaStats.reached;
     bmVanishedEl.textContent = bermudaStats.vanished;
@@ -740,22 +820,17 @@
       : "-";
   }
 
-  // 消失海域に入った瞬間、ペンが離されたのと同じ扱いで記録を強制終了する。
-  // (activePointerIdはまだ実際のpointerupまで維持し、vanishedActiveフラグで
-  //  このジェスチャーの残りのpointermoveを無視する。本物のpointerupが来たら
-  //  endStroke側でactivePointerId等を正常にクリアする。)
-  function triggerBermudaVanish() {
-    if (currentStroke && currentStroke.points.length > 1) {
-      strokes.push(currentStroke);
-    }
-    currentStroke = null;
+  // 消失海域に入った瞬間の処理。ペンが離されたわけではないので録画は止めない。
+  // 以後はこのジェスチャー(ペンが触れている間)、記録する座標を「消失した瞬間の
+  // 最後の座標」に固定して延長し続ける(実際のペン位置は無視する)。
+  // 統計上の「vanished」はこのジェスチャー内で最初に入った時に1回だけ数える。
+  function enterVanishState(freezeXPx, freezeYPx) {
     vanishedActive = true;
-    recBadge.classList.remove("on");
+    vanishFreezeXPx = freezeXPx;
+    vanishFreezeYPx = freezeYPx;
     bermudaStats.vanished++;
-    updateCounts();
     updateBermudaStatsUI();
-    redrawAll();
-    log(`消失海域に入ったため記録を停止しました（今回のR_vanish = ${currentRVanishNorm.toFixed(3)}）`);
+    log(`消失海域に入りました。以後はペンが触れている間、最後の座標のまま記録を続けます（今回のR_vanish = ${currentRVanishNorm.toFixed(3)}）`);
   }
 
   // ------------------------------------------------------------------
@@ -794,11 +869,19 @@
     bermudaReachedThisGesture = false;
 
     // バミューダが置かれていれば、この試行のR_vanishをここでサンプリングする
-    // (試行=ストロークごとに毎回引き直す。sigmaが大きいほど到達しにくくなる)
+    // (試行=レコードを開始するたび、つまりストロークごとに毎回引き直す)。
+    // N(mu,sigma)を素直にサンプリングし、絶対値を取って折り返す(=幅は常に非負)。
+    // muを0にした場合、これは実質ハーフノーマル分布になる。
+    // ただし折り返しただけだと典型的な大きさが約0.8*sigmaにもなり、
+    // 「sigmaがそのまま典型的なばらつきの目安」という直感より一回り大きく出すぎるため、
+    // 半分にして典型的な大きさを約0.4*sigma程度まで縮める
+    // (=同じepsilonに対して、より広いsigmaの範囲で「小さいsigma→よく届く」が
+    //  体感的に成立するようにする、という意図的なスケール調整)。
     if (bermuda) {
       const { mu, sigma } = getBermudaParams();
-      currentRVanishNorm = Math.max(0, sampleGaussian(mu, sigma));
+      currentRVanishNorm = Math.abs(sampleGaussian(mu, sigma)) / 2;
       currentRVanishPx = normToPx(currentRVanishNorm);
+      hasBermudaSample = true;
       bermudaStats.attempts++;
       updateBermudaStatsUI();
     }
@@ -809,21 +892,21 @@
       points: [makePoint(evt, xPx, yPx)],
     };
 
-    // タップした瞬間すでに消失海域の中だった場合も、入った扱いにする
+    // タップした瞬間すでに消失海域の中だった場合も、入った扱いにする(その座標で固定)
     if (bermuda && isInsideVanishSea(xPx, yPx, currentRVanishPx)) {
-      triggerBermudaVanish();
+      enterVanishState(xPx, yPx);
     }
 
     if (!liveTickRunning) {
       liveTickRunning = true;
       requestAnimationFrame(tickLiveStats);
     }
+    redrawAll(); // サンプリングされたリングの見た目を即座に反映する
   }
 
   function onPointerMove(evt) {
     if (activePointerId !== evt.pointerId) return;
     evt.preventDefault();
-    if (vanishedActive) return; // 消失後は実際にpointerupが来るまで残りの移動を無視する
 
     // coalesced events が使えるブラウザなら、間引かれる前の点も拾う
     const events = (typeof evt.getCoalescedEvents === "function")
@@ -833,15 +916,31 @@
     for (const e of (events.length ? events : [evt])) {
       let [xPx, yPx] = getLocalPos(e);
 
-      // 消失海域への進入判定を最優先でチェックする(検出したらこのジェスチャーは終了)
-      if (bermuda && isInsideVanishSea(xPx, yPx, currentRVanishPx)) {
-        triggerBermudaVanish();
-        return;
+      // 消失海域への進入判定(まだ消失していない場合のみ)。入った瞬間の座標を
+      // 「最後の座標」として固定し、以後はペンが触れている間その座標のまま
+      // 記録を延長し続ける(ペンが離れたことにはしない)。
+      // 判定は「前回の記録点 -> 今回の点」の線分ベースで行う。1点ずつの内外判定
+      // だけだと、速く動かした時やσが小さく輪が薄い時にサンプル点が輪を
+      // すり抜けて検出漏れし、本来消失するはずの試行が届いてしまうため。
+      if (!vanishedActive && bermuda) {
+        const last = currentStroke && currentStroke.points.length
+          ? currentStroke.points[currentStroke.points.length - 1]
+          : null;
+        const entered = last
+          ? segmentEntersVanishSea(last.x_px, last.y_px, xPx, yPx, currentRVanishPx)
+          : isInsideVanishSea(xPx, yPx, currentRVanishPx);
+        if (entered) {
+          enterVanishState(last ? last.x_px : xPx, last ? last.y_px : yPx);
+        }
       }
 
-      // バミューダ本体・ルーラー: 本物の定規のように、内側に入ろうとした点は
-      // 縁に吸着させてなぞり続けられるようにする（ストロークは分割しない）。
-      if (bermuda && isInsideBermudaCore(xPx, yPx)) {
+      if (vanishedActive) {
+        // 消失後: 実際のペン位置は無視し、固定した座標をそのまま延長する
+        xPx = vanishFreezeXPx;
+        yPx = vanishFreezeYPx;
+      } else if (bermuda && isInsideBermudaCore(xPx, yPx)) {
+        // バミューダ本体・ルーラー: 本物の定規のように、内側に入ろうとした点は
+        // 縁に吸着させてなぞり続けられるようにする（ストロークは分割しない）。
         bermudaReachedThisGesture = true;
         [xPx, yPx] = clampToBermudaCore(xPx, yPx);
       } else if (isInsideRuler(xPx, yPx)) {
@@ -1356,6 +1455,13 @@
     bermuda = null;
     redrawAll();
     log("バミューダを削除しました");
+  });
+  // R_balmuda/μ/σを変更したら、即座にμリングやバミューダ本体の見た目・表示中のμ値に反映する
+  [bermudaRadiusInput, bermudaMuInput, bermudaSigmaInput, bermudaEpsilonInput].forEach((el) => {
+    el.addEventListener("input", () => {
+      updateBermudaStatsUI();
+      redrawAll();
+    });
   });
 
   function sleep(ms) {
