@@ -1395,6 +1395,34 @@
   canvas.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
   document.addEventListener("gesturestart", (e) => e.preventDefault());
 
+  // iPad/Safari(WebKit)の既知の癖への対策: Apple Pencilでキャンバスに触れた後、
+  // ソフトウェアキーボード自体が(指操作なら平気なのに)出なくなることがある。
+  // これはWebView側の「キーボードを出す」機能がPencil入力をきっかけに
+  // 無効化されたままになってしまうことがあるためらしい。
+  // 対策として、Pencilのストロークが終わる(pointerup/cancel/leave)たびに、
+  // 画面外に隠したinput要素へ一瞬だけフォーカスを当てて外すことで、
+  // WebView側のキーボード機能を強制的に再度有効化しておく。
+  function wakeUpSoftKeyboard() {
+    const dummy = document.createElement("input");
+    dummy.setAttribute("type", "text");
+    dummy.setAttribute("aria-hidden", "true");
+    dummy.style.position = "fixed";
+    dummy.style.top = "-1000px";
+    dummy.style.left = "-1000px";
+    dummy.style.width = "1px";
+    dummy.style.height = "1px";
+    dummy.style.opacity = "0";
+    document.body.appendChild(dummy);
+    dummy.focus();
+    dummy.blur();
+    document.body.removeChild(dummy);
+  }
+  ["pointerup", "pointercancel", "pointerleave"].forEach((type) => {
+    canvas.addEventListener(type, (evt) => {
+      if (evt.pointerType === "pen") wakeUpSoftKeyboard();
+    }, { passive: true });
+  });
+
   // ------------------------------------------------------------------
   // 操作ボタン
   // ------------------------------------------------------------------
