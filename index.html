@@ -297,10 +297,10 @@
   <div id="bermudaPanel">
     <div id="bermudaHeader">🌀 バミューダ設定（バミューダモードでキャンバスをタップ/ドラッグして位置を置く）</div>
     <div class="bermuda-controls">
-      <label>R_balmuda <input id="bermudaRadiusInput" type="number" step="0.01" min="0.01" max="0.9" value="0.08"></label>
-      <label>μ (R_vanish) <input id="bermudaMuInput" type="number" step="0.01" value="0"></label>
-      <label>σ (R_vanish) <input id="bermudaSigmaInput" type="number" step="0.01" min="0" value="0.05"></label>
-      <label>ε (許容幅) <input id="bermudaEpsilonInput" type="number" step="0.005" min="0" value="0.02"></label>
+      <label>R_balmuda <input id="bermudaRadiusInput" type="number" inputmode="decimal" step="0.01" min="0.01" max="0.9" value="0.08"></label>
+      <label>μ (R_vanish) <input id="bermudaMuInput" type="number" inputmode="decimal" step="0.01" min="-1" max="1" value="0"></label>
+      <label>σ (R_vanish) <input id="bermudaSigmaInput" type="number" inputmode="decimal" step="0.01" min="0" value="0.05"></label>
+      <label>ε (許容幅) <input id="bermudaEpsilonInput" type="number" inputmode="decimal" step="0.005" min="0" value="0.02"></label>
     </div>
     <div id="bermudaStats">μ: <span id="bmMu">0</span> &nbsp;|&nbsp; Attempts: <span id="bmAttempts">0</span> &nbsp;|&nbsp; Reached: <span id="bmReached">0</span> &nbsp;|&nbsp; Vanished: <span id="bmVanished">0</span> &nbsp;|&nbsp; Success rate: <span id="bmRate">-</span></div>
   </div>
