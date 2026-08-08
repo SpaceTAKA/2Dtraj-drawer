@@ -298,11 +298,11 @@
     <div id="bermudaHeader">🌀 バミューダ設定（バミューダモードでキャンバスをタップ/ドラッグして位置を置く）</div>
     <div class="bermuda-controls">
       <label>R_balmuda <input id="bermudaRadiusInput" type="number" inputmode="decimal" step="0.01" min="0.01" max="0.9" value="0.08"></label>
-      <label>μ (R_vanish) <input id="bermudaMuInput" type="number" inputmode="decimal" step="0.01" min="-1" max="1" value="0"></label>
-      <label>σ (R_vanish) <input id="bermudaSigmaInput" type="number" inputmode="decimal" step="0.01" min="0" value="0.05"></label>
+      <label>μ (R_vanishの平均幅) <input id="bermudaMuInput" type="number" inputmode="decimal" step="0.01" min="0" max="1" value="0.03"></label>
+      <label>σ (R_vanishの標準偏差) <input id="bermudaSigmaInput" type="number" inputmode="decimal" step="0.01" min="0" value="0.05"></label>
       <label>ε (許容幅) <input id="bermudaEpsilonInput" type="number" inputmode="decimal" step="0.005" min="0" value="0.02"></label>
     </div>
-    <div id="bermudaStats">μ: <span id="bmMu">0</span> &nbsp;|&nbsp; Attempts: <span id="bmAttempts">0</span> &nbsp;|&nbsp; Reached: <span id="bmReached">0</span> &nbsp;|&nbsp; Vanished: <span id="bmVanished">0</span> &nbsp;|&nbsp; Success rate: <span id="bmRate">-</span></div>
+    <div id="bermudaStats">μ: <span id="bmMu">0.03</span> &nbsp;|&nbsp; Attempts: <span id="bmAttempts">0</span> &nbsp;|&nbsp; Reached: <span id="bmReached">0</span> &nbsp;|&nbsp; Vanished: <span id="bmVanished">0</span> &nbsp;|&nbsp; Success rate: <span id="bmRate">-</span></div>
   </div>
 
   <div class="controls">
@@ -674,15 +674,16 @@
   // ------------------------------------------------------------------
 
   // 入力欄から現在のパラメータを都度読み取る(正規化単位)。
+  // mu: R_vanishの平均幅(>=0)。sigma: R_vanishの標準偏差(trialごとのブレの大きさ)。
+  // R_vanishはガンマ分布(下のsampleGamma参照)からサンプリングするので、
+  // mu・sigmaはそのまま平均・標準偏差として正確に機能する。
   // epsilon: 「これより薄い消失海域は実質ゼロ(=踏み越えられる)」とみなす許容幅。
-  // R_vanishは折り返し正規分布(下の sampleGaussian の呼び出し側でabsを取る)なので
-  // 連続分布であり、ちょうど0になる確率は理論上ゼロ。そのため「実質ゼロ」を
-  // 判定するための有限の閾値が必要で、epsilonがその役割を持つ
-  // (muを0にしてσだけで到達率を作りたい場合、このepsilonが実質的な基準線になる)。
+  // ガンマ分布は連続分布なので、ちょうど0になる確率は理論上ゼロ。そのため
+  // 「実質ゼロ」を判定するための有限の閾値が必要で、epsilonがその役割を持つ。
   function getBermudaParams() {
     return {
       rBalmuda: Math.max(0.001, parseFloat(bermudaRadiusInput.value) || 0),
-      mu: parseFloat(bermudaMuInput.value) || 0,
+      mu: Math.max(0, parseFloat(bermudaMuInput.value) || 0),
       sigma: Math.max(0, parseFloat(bermudaSigmaInput.value) || 0),
       epsilon: Math.max(0, parseFloat(bermudaEpsilonInput.value) || 0),
     };
@@ -695,6 +696,53 @@
     const u2 = Math.random();
     const z0 = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
     return mu + sigma * z0;
+  }
+
+  // R_vanishのための分布: 正規分布は実数全体に値を取るので、「幅」のような
+  // 非負量には本質的に相性が悪い(負に振れた分をクランプ/折り返すと、
+  // sigmaを大きくしただけで平均的な大きさそのものが引き上がってしまい、
+  // 「muを中心に、sigmaが大きいほど大きかったり小さかったりの差が激しくなる」
+  // という狙った独立な関係にならない)。
+  // そこで、そもそも非負の値しか取らないガンマ分布を使い、
+  // 平均=mu・標準偏差=sigma になるように shape(k)とscale(theta)を逆算する
+  // (k = (mu/sigma)^2, theta = sigma^2/mu)。これによりmuとsigmaが
+  // 数式的にも「平均」と「標準偏差」そのものとして正確に機能する:
+  //   - sigma << mu (k大) : ほぼmuに集中した釣鐘型分布 (muの値にほぼ一致)
+  //   - sigma >> mu (k<1) : 0近くに密集しつつ、稀に非常に大きな値も出る
+  //                          非対称な分布 (「差が激しい」を体現)
+  // shapeが1未満の場合は「ブースト法」(Gamma(k+1,1)を使い、それをU^(1/k)倍する)
+  // を使う。shapeが1以上の場合はMarsaglia-Tsang法を使う。どちらも標準的な
+  // ガンマ分布サンプリング法。
+  function sampleGammaShape1(k) {
+    if (k < 1) {
+      const g = sampleGammaShape1(k + 1);
+      const u = Math.random();
+      return g * Math.pow(u, 1 / k);
+    }
+    const d = k - 1 / 3;
+    const c = 1 / Math.sqrt(9 * d);
+    for (;;) {
+      let x, v;
+      do {
+        x = sampleGaussian(0, 1);
+        v = 1 + c * x;
+      } while (v <= 0);
+      v = v * v * v;
+      const u = Math.random();
+      const x2 = x * x;
+      if (u < 1 - 0.0331 * x2 * x2) return d * v;
+      if (Math.log(u) < 0.5 * x2 + d * (1 - v + Math.log(v))) return d * v;
+    }
+  }
+
+  // 平均mean・標準偏差stdのガンマ分布からサンプリングする。
+  // mean<=0は「目標となる幅が無い」という退化ケースとして扱い、常に0を返す
+  // (=消失海域が実質存在しない=常に届く)。
+  function sampleGamma(mean, std) {
+    if (mean <= 0 || std <= 0) return Math.max(0, mean);
+    const k = (mean / std) * (mean / std);
+    const theta = (std * std) / mean;
+    return sampleGammaShape1(k) * theta;
   }
 
   function bermudaDistPx(xPx, yPx) {
@@ -870,16 +918,13 @@
 
     // バミューダが置かれていれば、この試行のR_vanishをここでサンプリングする
     // (試行=レコードを開始するたび、つまりストロークごとに毎回引き直す)。
-    // N(mu,sigma)を素直にサンプリングし、絶対値を取って折り返す(=幅は常に非負)。
-    // muを0にした場合、これは実質ハーフノーマル分布になる。
-    // ただし折り返しただけだと典型的な大きさが約0.8*sigmaにもなり、
-    // 「sigmaがそのまま典型的なばらつきの目安」という直感より一回り大きく出すぎるため、
-    // 半分にして典型的な大きさを約0.4*sigma程度まで縮める
-    // (=同じepsilonに対して、より広いsigmaの範囲で「小さいsigma→よく届く」が
-    //  体感的に成立するようにする、という意図的なスケール調整)。
+    // ガンマ分布(平均=mu, 標準偏差=sigma)からサンプリングする。
+    // muが「典型的な幅」、sigmaが「trialごとのブレの大きさ」を、それぞれ
+    // 独立かつそのままの意味で表す(正規分布の折り返しのように、sigmaを
+    // 大きくすると平均そのものまで引き上がってしまう、という副作用がない)。
     if (bermuda) {
       const { mu, sigma } = getBermudaParams();
-      currentRVanishNorm = Math.abs(sampleGaussian(mu, sigma)) / 2;
+      currentRVanishNorm = sampleGamma(mu, sigma);
       currentRVanishPx = normToPx(currentRVanishNorm);
       hasBermudaSample = true;
       bermudaStats.attempts++;
