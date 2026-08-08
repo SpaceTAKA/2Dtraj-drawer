@@ -10,5 +10,9 @@ if git diff --cached --quiet; then
 else
   git commit -m "update $(date '+%Y-%m-%d %H:%M:%S')"
 fi
-git push
+if ! git push; then
+  echo "pushが拒否されました(リモートに未取得の変更があるようです)。取り込んで再試行します..."
+  git pull --rebase origin main
+  git push
+fi
 echo "push完了。GitHub Pagesの反映まで1分ほど待ってからiPadでリロードしてください。"
