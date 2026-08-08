@@ -301,6 +301,7 @@
       <label>μ (中心オフセット) <input id="bermudaMuInput" type="number" inputmode="decimal" step="0.01" min="-1" max="1" value="0"></label>
       <label>σ (ばらつきの大きさ) <input id="bermudaSigmaInput" type="number" inputmode="decimal" step="0.01" min="0" value="0.05"></label>
       <label>ε (許容幅) <input id="bermudaEpsilonInput" type="number" inputmode="decimal" step="0.005" min="0" value="0.02"></label>
+      <label>R_limit (限界半径) <input id="bermudaRLimitInput" type="number" inputmode="decimal" step="0.01" min="0.01" max="1" value="0.3"></label>
     </div>
     <div id="bermudaStats">μ: <span id="bmMu">0</span> &nbsp;|&nbsp; Attempts: <span id="bmAttempts">0</span> &nbsp;|&nbsp; Reached: <span id="bmReached">0</span> &nbsp;|&nbsp; Vanished: <span id="bmVanished">0</span> &nbsp;|&nbsp; Success rate: <span id="bmRate">-</span></div>
   </div>
@@ -367,6 +368,7 @@
   const bermudaMuInput = document.getElementById("bermudaMuInput");
   const bermudaSigmaInput = document.getElementById("bermudaSigmaInput");
   const bermudaEpsilonInput = document.getElementById("bermudaEpsilonInput");
+  const bermudaRLimitInput = document.getElementById("bermudaRLimitInput");
   const bmMuEl = document.getElementById("bmMu");
   const bmAttemptsEl = document.getElementById("bmAttempts");
   const bmReachedEl = document.getElementById("bmReached");
@@ -676,7 +678,8 @@
   // 入力欄から現在のパラメータを都度読み取る(正規化単位)。
   // mu: 折り返し前の正規分布の中心(0でよい)。sigma: その標準偏差
   // (=R_vanishがどれだけ0〜広い範囲でばらけるかを直接決める)。
-  // R_vanish = |N(mu,sigma)| (下のsampleFoldedGaussian参照)。
+  // rLimit: R_vanishの上限(=消失海域が絶対にこれより厚くならない限界半径)。
+  // R_vanish = min(rLimit, |N(mu,sigma)|) (下のsampleRVanish参照)。
   // epsilon: 「これより薄い消失海域は実質ゼロ(=踏み越えられる)」とみなす許容幅。
   // 折り返し正規分布は連続分布なので、ちょうど0になる確率は理論上ゼロ。そのため
   // 「実質ゼロ」を判定するための有限の閾値が必要で、epsilonがその役割を持つ。
@@ -686,6 +689,7 @@
       mu: parseFloat(bermudaMuInput.value) || 0,
       sigma: Math.max(0, parseFloat(bermudaSigmaInput.value) || 0),
       epsilon: Math.max(0, parseFloat(bermudaEpsilonInput.value) || 0),
+      rLimit: Math.max(0, parseFloat(bermudaRLimitInput.value) || 0),
     };
   }
 
@@ -708,6 +712,19 @@
   // sigmaと平均を無理に分離しようとしない、という一番シンプルな形)。
   function sampleFoldedGaussian(mu, sigma) {
     return Math.abs(sampleGaussian(mu, sigma));
+  }
+
+  // 実際にストローク開始時に使うR_vanishの値。折り返し正規分布の値を
+  // rLimit(限界半径)で上から切り詰める(=打ち切り/censored半正規分布)。
+  // これにより「sigmaがどれだけ大きくても、消失海域の厚みは絶対にrLimitを
+  // 超えない」という上限を明示的に持たせる。sigmaが小さいうちはrLimitに
+  // ほぼ引っかからず0近くに張り付いたまま、sigmaを大きくしていくと
+  // 0〜rLimitの範囲でよくばらけるようになり(=打ち切りの影響が増す)、
+  // sigmaがrLimitに対して十分大きくなると多くの試行がrLimitちょうどに
+  // 張り付くようになる(=消失海域が常に最大の厚みで存在する状態に近づく)。
+  function sampleRVanish(mu, sigma, rLimit) {
+    const raw = sampleFoldedGaussian(mu, sigma);
+    return rLimit > 0 ? Math.min(raw, rLimit) : raw;
   }
 
   function bermudaDistPx(xPx, yPx) {
@@ -768,8 +785,23 @@
   // 「到達」になる、という今の到達判定がそのまま視覚的に読めるようにしている。
   function drawBermudaOverlay() {
     if (!bermuda) return;
-    const { rBalmuda, mu, epsilon } = getBermudaParams();
+    const { rBalmuda, mu, epsilon, rLimit } = getBermudaParams();
     const rCorePx = normToPx(rBalmuda);
+
+    // 限界半径rLimitの外周(常時表示、太めの実線)。R_vanishはどれだけsigmaを
+    // 大きくしてもこのリングより外に出ない、という絶対的な上限を示す。
+    if (rLimit > 0) {
+      const limitRingPx = rCorePx + normToPx(rLimit);
+      ctx.save();
+      ctx.setLineDash([]);
+      ctx.strokeStyle = "#1e293b";
+      ctx.lineWidth = 1.5;
+      ctx.globalAlpha = 0.6;
+      ctx.beginPath();
+      ctx.arc(bermuda.cx, bermuda.cy, limitRingPx, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
 
     // 平均的な消失海域の外周 (mu基準。常時表示、σによる試行ごとのブレの「基準線」)
     const muRingPx = rCorePx + normToPx(Math.max(0, mu));
@@ -883,12 +915,12 @@
 
     // バミューダが置かれていれば、この試行のR_vanishをここでサンプリングする
     // (試行=レコードを開始するたび、つまりストロークごとに毎回引き直す)。
-    // 折り返し正規分布 |N(mu,sigma)| からサンプリングする。sigmaが小さいと
-    // muの近く(muを省略/0なら0の近く)に張り付き、sigmaが大きいと
-    // 0〜正規分布的な範囲でよくばらける。
+    // 折り返し正規分布 |N(mu,sigma)| を rLimit で上から打ち切ってサンプリングする。
+    // sigmaが小さいとmuの近く(muを省略/0なら0の近く)に張り付き、sigmaが
+    // 大きいと0〜rLimitの範囲でよくばらける(rLimitより厚くはならない)。
     if (bermuda) {
-      const { mu, sigma } = getBermudaParams();
-      currentRVanishNorm = sampleFoldedGaussian(mu, sigma);
+      const { mu, sigma, rLimit } = getBermudaParams();
+      currentRVanishNorm = sampleRVanish(mu, sigma, rLimit);
       currentRVanishPx = normToPx(currentRVanishNorm);
       hasBermudaSample = true;
       bermudaStats.attempts++;
@@ -1494,7 +1526,7 @@
     log("バミューダを削除しました");
   });
   // R_balmuda/μ/σを変更したら、即座にμリングやバミューダ本体の見た目・表示中のμ値に反映する
-  [bermudaRadiusInput, bermudaMuInput, bermudaSigmaInput, bermudaEpsilonInput].forEach((el) => {
+  [bermudaRadiusInput, bermudaMuInput, bermudaSigmaInput, bermudaEpsilonInput, bermudaRLimitInput].forEach((el) => {
     el.addEventListener("input", () => {
       updateBermudaStatsUI();
       redrawAll();
