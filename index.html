@@ -258,6 +258,22 @@
   #bermudaStats {
     font-size: 12px;
     color: var(--muted);
+    margin-bottom: 6px;
+  }
+  #bermudaDistWrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  #bermudaDistCanvas {
+    background: #f8fafc;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+  }
+  #bermudaDistLegend {
+    font-size: 11px;
+    color: var(--muted);
+    line-height: 1.6;
   }
   #log {
     width: var(--canvas-size);
@@ -303,7 +319,16 @@
       <label>ε (許容幅) <input id="bermudaEpsilonInput" type="number" inputmode="decimal" step="0.005" min="0" value="0.02"></label>
       <label>R_limit (限界半径) <input id="bermudaRLimitInput" type="number" inputmode="decimal" step="0.01" min="0.01" max="1" value="0.3"></label>
     </div>
-    <div id="bermudaStats">μ: <span id="bmMu">0.03</span> &nbsp;|&nbsp; Attempts: <span id="bmAttempts">0</span> &nbsp;|&nbsp; Reached: <span id="bmReached">0</span> &nbsp;|&nbsp; Vanished: <span id="bmVanished">0</span> &nbsp;|&nbsp; Success rate: <span id="bmRate">-</span></div>
+    <div id="bermudaStats">μ: <span id="bmMu">0.03</span> &nbsp;|&nbsp; 今回のR_vanish: <span id="bmRVanish">-</span> &nbsp;|&nbsp; Attempts: <span id="bmAttempts">0</span> &nbsp;|&nbsp; Reached: <span id="bmReached">0</span> &nbsp;|&nbsp; Vanished: <span id="bmVanished">0</span> &nbsp;|&nbsp; Success rate: <span id="bmRate">-</span></div>
+    <div id="bermudaDistWrap">
+      <canvas id="bermudaDistCanvas" width="280" height="110"></canvas>
+      <div id="bermudaDistLegend">
+        <div>グレー破線: μ</div>
+        <div>緑点線: ε</div>
+        <div>紺色実線: R_limit</div>
+        <div>紫の点: 今回のサンプル</div>
+      </div>
+    </div>
   </div>
 
   <div class="controls">
@@ -370,10 +395,13 @@
   const bermudaEpsilonInput = document.getElementById("bermudaEpsilonInput");
   const bermudaRLimitInput = document.getElementById("bermudaRLimitInput");
   const bmMuEl = document.getElementById("bmMu");
+  const bmRVanishEl = document.getElementById("bmRVanish");
   const bmAttemptsEl = document.getElementById("bmAttempts");
   const bmReachedEl = document.getElementById("bmReached");
   const bmVanishedEl = document.getElementById("bmVanished");
   const bmRateEl = document.getElementById("bmRate");
+  const bermudaDistCanvas = document.getElementById("bermudaDistCanvas");
+  const bermudaDistCtx = bermudaDistCanvas.getContext("2d");
 
   let cssSize = 0;       // CSS上のキャンバス一辺の長さ(px)
   let dpr = window.devicePixelRatio || 1;
@@ -761,6 +789,131 @@
     return rLimit > 0 ? Math.min(raw, rLimit) : raw;
   }
 
+  // ------------------------------------------------------------------
+  // 分布の形そのもの(ガンマ分布のPDF)を可視化するための小さなグラフ。
+  // JSにはガンマ関数(Γ)が標準で無いため、Lanczos近似でlnΓ(x)を計算し、
+  // そこからPDFを対数領域で計算して指数を取る(数値的に安定させるため)。
+  // ------------------------------------------------------------------
+  function lnGamma(x) {
+    const g = 7;
+    const c = [
+      0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+      771.32342877765313, -176.61502916214059, 12.507343278686905,
+      -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7,
+    ];
+    if (x < 0.5) {
+      // 反射公式でx<0.5の場合もカバー(kが極小のときの安全策)
+      return Math.log(Math.PI / Math.sin(Math.PI * x)) - lnGamma(1 - x);
+    }
+    x -= 1;
+    let a = c[0];
+    const t = x + g + 0.5;
+    for (let i = 1; i < g + 2; i++) a += c[i] / (x + i);
+    return 0.5 * Math.log(2 * Math.PI) + (x + 0.5) * Math.log(t) - t + Math.log(a);
+  }
+
+  // ガンマ分布(形状k, 尺度theta)のPDFをx地点で評価する。x<=0は0を返す
+  // (k<1のときx→0でPDFは理論上+∞に発散するが、グラフ表示では後段で
+  // 上限にクリップして「0付近で急激に立ち上がる」ことだけを見せる)。
+  function gammaPdf(x, k, theta) {
+    if (x <= 0 || k <= 0 || theta <= 0) return 0;
+    const logPdf = (k - 1) * Math.log(x) - x / theta - k * Math.log(theta) - lnGamma(k);
+    return Math.exp(logPdf);
+  }
+
+  function drawBermudaDistPlot() {
+    const { mu, sigma, epsilon, rLimit } = getBermudaParams();
+    const ctx = bermudaDistCtx;
+    const W = bermudaDistCanvas.width, H = bermudaDistCanvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    const padL = 6, padR = 6, padT = 8, padB = 16;
+    const plotW = W - padL - padR, plotH = H - padT - padB;
+
+    if (sigma <= 0) {
+      // sigma=0は退化分布(常にmuちょうど)なので、PDFの代わりに縦線1本を描く
+      const xMax = Math.max(mu * 1.5, rLimit, 0.05);
+      const xToPx = (x) => padL + (x / xMax) * plotW;
+      ctx.strokeStyle = "#0f172a";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(xToPx(mu), padT);
+      ctx.lineTo(xToPx(mu), padT + plotH);
+      ctx.stroke();
+    } else {
+      const k = (mu / sigma) * (mu / sigma);
+      const theta = (sigma * sigma) / mu;
+      // 表示範囲: mu+4*sigmaかR_limitの少し外側のうち大きい方まで
+      const xMax = Math.max(mu + 4 * sigma, rLimit * 1.15, mu * 1.2, 0.02);
+      const N = 120;
+      const xs = new Array(N + 1);
+      const ys = new Array(N + 1);
+      for (let i = 0; i <= N; i++) {
+        const x = (xMax * i) / N;
+        xs[i] = x;
+        ys[i] = i === 0 ? 0 : gammaPdf(x, k, theta);
+      }
+      // k<1だと最初の数点が発散して他が見えなくなるので、
+      // x >= xMax*0.03 の範囲でスケールの基準となる最大値を決める
+      let yMax = 0;
+      for (let i = 0; i <= N; i++) {
+        if (xs[i] >= xMax * 0.03 && isFinite(ys[i])) yMax = Math.max(yMax, ys[i]);
+      }
+      if (yMax <= 0 || !isFinite(yMax)) yMax = 1;
+      const yCap = yMax * 1.15; // これより高い値(発散スパイク)は頭打ちにする
+
+      const xToPx = (x) => padL + (x / xMax) * plotW;
+      const yToPx = (y) => padT + plotH - (Math.min(y, yCap) / yCap) * plotH;
+
+      ctx.strokeStyle = "#f97316";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(xToPx(xs[0]), yToPx(0));
+      for (let i = 0; i <= N; i++) ctx.lineTo(xToPx(xs[i]), yToPx(ys[i]));
+      ctx.lineTo(xToPx(xs[N]), padT + plotH);
+      ctx.closePath();
+      ctx.fillStyle = "rgba(249,115,22,0.15)";
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(xToPx(xs[0]), yToPx(ys[0]));
+      for (let i = 0; i <= N; i++) ctx.lineTo(xToPx(xs[i]), yToPx(ys[i]));
+      ctx.stroke();
+
+      // 縦の目印: μ(グレー破線)、ε(緑点線)、R_limit(紺色実線)
+      const drawVLine = (x, color, dash) => {
+        if (x < 0 || x > xMax) return;
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.5;
+        if (dash) ctx.setLineDash(dash);
+        ctx.beginPath();
+        ctx.moveTo(xToPx(x), padT);
+        ctx.lineTo(xToPx(x), padT + plotH);
+        ctx.stroke();
+        ctx.restore();
+      };
+      drawVLine(mu, "#64748b", [4, 3]);
+      drawVLine(epsilon, "#22c55e", [1, 2]);
+      if (rLimit > 0) drawVLine(rLimit, "#1e293b", null);
+
+      // 今回サンプリングされた値を紫の点でx軸上に打つ
+      if (hasBermudaSample && currentRVanishNorm >= 0 && currentRVanishNorm <= xMax) {
+        ctx.fillStyle = "#a855f7";
+        ctx.beginPath();
+        ctx.arc(xToPx(currentRVanishNorm), padT + plotH, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // x軸
+    ctx.strokeStyle = "#cbd5e1";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(padL, padT + plotH);
+    ctx.lineTo(W - padR, padT + plotH);
+    ctx.stroke();
+  }
+
   function bermudaDistPx(xPx, yPx) {
     const dx = xPx - bermuda.cx, dy = yPx - bermuda.cy;
     return Math.sqrt(dx * dx + dy * dy);
@@ -891,12 +1044,22 @@
 
   function updateBermudaStatsUI() {
     bmMuEl.textContent = getBermudaParams().mu.toFixed(3);
+    if (hasBermudaSample) {
+      const { epsilon } = getBermudaParams();
+      const belowEpsilon = currentRVanishNorm < epsilon;
+      bmRVanishEl.textContent = belowEpsilon
+        ? `${currentRVanishNorm.toFixed(4)}（ε未満=消失なし扱い）`
+        : currentRVanishNorm.toFixed(4);
+    } else {
+      bmRVanishEl.textContent = "-";
+    }
     bmAttemptsEl.textContent = bermudaStats.attempts;
     bmReachedEl.textContent = bermudaStats.reached;
     bmVanishedEl.textContent = bermudaStats.vanished;
     bmRateEl.textContent = bermudaStats.attempts > 0
       ? `${((100 * bermudaStats.reached) / bermudaStats.attempts).toFixed(1)}%`
       : "-";
+    drawBermudaDistPlot();
   }
 
   // 消失海域に入った瞬間の処理。ペンが離されたわけではないので録画は止めない。
