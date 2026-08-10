@@ -314,10 +314,11 @@
     <div id="bermudaHeader">🌀 バミューダ設定（バミューダモードでキャンバスをタップ/ドラッグして位置を置く）</div>
     <div class="bermuda-controls">
       <label>R_balmuda <input id="bermudaRadiusInput" type="number" inputmode="decimal" step="0.01" min="0.01" max="0.9" value="0.08"></label>
-      <label>μ (平均幅) <input id="bermudaMuInput" type="number" inputmode="decimal" step="0.01" min="0.01" max="1" value="0.03"></label>
+      <label>μ (基準位置) <input id="bermudaMuInput" type="number" inputmode="decimal" step="0.01" min="0.01" max="1" value="0.03"></label>
       <label>σ (標準偏差) <input id="bermudaSigmaInput" type="number" inputmode="decimal" step="0.01" min="0" value="0.05"></label>
       <label>ε (許容幅) <input id="bermudaEpsilonInput" type="number" inputmode="decimal" step="0.005" min="0" value="0.02"></label>
       <label>R_limit (限界半径) <input id="bermudaRLimitInput" type="number" inputmode="decimal" step="0.01" min="0.01" max="1" value="0.3"></label>
+      <label><input id="bermudaRLimitEnabledInput" type="checkbox"> R_limitを有効にする</label>
     </div>
     <div id="bermudaStats">μ: <span id="bmMu">0.03</span> &nbsp;|&nbsp; 今回のR_vanish: <span id="bmRVanish">-</span> &nbsp;|&nbsp; Attempts: <span id="bmAttempts">0</span> &nbsp;|&nbsp; Reached: <span id="bmReached">0</span> &nbsp;|&nbsp; Vanished: <span id="bmVanished">0</span> &nbsp;|&nbsp; Success rate: <span id="bmRate">-</span></div>
     <div id="bermudaDistWrap">
@@ -394,6 +395,7 @@
   const bermudaSigmaInput = document.getElementById("bermudaSigmaInput");
   const bermudaEpsilonInput = document.getElementById("bermudaEpsilonInput");
   const bermudaRLimitInput = document.getElementById("bermudaRLimitInput");
+  const bermudaRLimitEnabledInput = document.getElementById("bermudaRLimitEnabledInput");
   const bmMuEl = document.getElementById("bmMu");
   const bmRVanishEl = document.getElementById("bmRVanish");
   const bmAttemptsEl = document.getElementById("bmAttempts");
@@ -704,18 +706,25 @@
   // ------------------------------------------------------------------
 
   // 入力欄から現在のパラメータを都度読み取る(正規化単位)。
-  // mu: R_vanishの平均幅(>0が必須。数学的にE[X]=0かつX>=0ならXは常に0になって
-  // しまうため、平均をちょうど0にはできない)。sigma: R_vanishの標準偏差。
-  // R_vanishはガンマ分布(平均=mu, 標準偏差=sigma)からサンプリングするので、
-  // 変動係数 CV = sigma/mu が分布の"形"(相対的なばらけ方)を直接決める:
-  //   sigma << mu (CV小) : muの近くに集中した釣鐘型 (相対的なばらけは小さい)
-  //   sigma >> mu (CV大) : 0近くに密集しつつ稀に大きな値も出る非対称な形
-  //                        (「小さい値/大きい値の差が激しい」を体現)
-  // rLimit: R_vanishの上限(=消失海域が絶対にこれより厚くならない限界半径)。
-  // R_vanish = min(rLimit, Gamma(mean=mu, std=sigma)) (下のsampleRVanish参照)。
+  // mu: R_vanishの基準位置(>0が必須)。0にすると|N(0,sigma)|=半正規分布になり、
+  // sigmaが単純な尺度(scale)そのものになってしまい、変動係数CV=std/meanが
+  // 常に一定(√(π/2−1)≈0.7555)に固定されて、sigmaで「相対的なばらけ方」を
+  // 制御できなくなる(尺度族の宿命、Monte Carloで実測・検証済み)。
+  // muを正の基準位置として与えることで単純な尺度族ではなくなり、
+  // sigma<<muならmu付近にタイトな山、sigma>>muなら0〜広い範囲へ末広がりに
+  // 広がる、という滑らかな形の変化を実現する(下のsampleRVanish参照)。
+  // rLimit / rLimitEnabled: 有効化した場合のみ、R_vanishをrLimitで上から
+  // 打ち切る。ただし有界な確率変数の分散には理論的な上限がある
+  // (Bhatia-Davis不等式: 値が[0,R]に収まる限り、分散はmax = mean×(R−mean)
+  // を超えられず、その上限に近づくほど0とRの2点に値が集中していく)ため、
+  // 有効化した状態でsigmaを大きくしすぎると、sigmaが「相対的なばらけ方」を
+  // 制御できなくなり0とrLimitの2点に張り付いていく。無効にすればR_vanishは
+  // 無制限に大きくなりうるが、その代わりsigmaがどれだけ大きくても分布は
+  // 滑らかに広がり続け、張り付きは起きない。
   // epsilon: 「これより薄い消失海域は実質ゼロ(=踏み越えられる)」とみなす許容幅。
-  // ガンマ分布は連続分布なので、ちょうど0になる確率は理論上ゼロ。そのため
-  // 「実質ゼロ」を判定するための有限の閾値が必要で、epsilonがその役割を持つ。
+  // 切断正規分布は連続分布なので、ちょうど0になる確率は理論上ゼロ。
+  // そのため「実質ゼロ」を判定するための有限の閾値が必要で、epsilonがその
+  // 役割を持つ。
   function getBermudaParams() {
     return {
       rBalmuda: Math.max(0.001, parseFloat(bermudaRadiusInput.value) || 0),
@@ -723,6 +732,7 @@
       sigma: Math.max(0, parseFloat(bermudaSigmaInput.value) || 0),
       epsilon: Math.max(0, parseFloat(bermudaEpsilonInput.value) || 0),
       rLimit: Math.max(0, parseFloat(bermudaRLimitInput.value) || 0),
+      rLimitEnabled: bermudaRLimitEnabledInput.checked,
     };
   }
 
@@ -735,104 +745,87 @@
     return mu + sigma * z0;
   }
 
-  // R_vanishのための分布: ガンマ分布(平均=mu, 標準偏差=sigma)。
-  // 「折り返し正規分布」のような単純な尺度族(X = sigma × 固定形の確率変数)では、
-  // sigmaを変えても変動係数CV=std/meanが常に一定になってしまい
-  // (半正規分布ならCV=√(π/2−1)≈0.7555で固定)、sigmaは値の大きさを
-  // 均等に引き伸ばすだけで「相対的なばらけ方」を全く変えられない
-  // (Monte Carloで実測・検証済み)。
-  // ガンマ分布は平均muと標準偏差sigmaを独立にとれるため、CV=sigma/muが
-  // そのまま分布の"形"を決める: sigma<<mu(CV小)ならmu付近に集中した
-  // 釣鐘型、sigma>>mu(CV大)なら0近くに密集しつつ稀に大きな値も出る
-  // 非対称な形になり、「sigmaが大きいほど値がよくばらける」を実現する。
-  // 形状パラメータk=(mu/sigma)^2、尺度パラメータtheta=sigma^2/muとして
-  // Marsaglia-Tsang法でサンプリングする(k<1の場合はブースト法を使う)。
-  function sampleGammaShape1(k) {
-    if (k < 1) {
-      // Gamma(k) = Gamma(k+1) * U^(1/k) というブースト法でk<1に対応
-      const g = sampleGammaShape1(k + 1);
-      const u = Math.random();
-      return g * Math.pow(u, 1 / k);
-    }
-    const d = k - 1 / 3;
-    const c = 1 / Math.sqrt(9 * d);
-    for (;;) {
-      let x, v;
-      do {
-        x = sampleGaussian(0, 1);
-        v = 1 + c * x;
-      } while (v <= 0);
-      v = v * v * v;
-      const u = Math.random();
-      const x2 = x * x;
-      if (u < 1 - 0.0331 * x2 * x2) return d * v;
-      if (Math.log(u) < 0.5 * x2 + d * (1 - v + Math.log(v))) return d * v;
-    }
-  }
-  function sampleGamma(mean, std) {
-    if (mean <= 0 || std <= 0) return Math.max(0, mean);
-    const k = (mean / std) * (mean / std);
-    const theta = (std * std) / mean;
-    return sampleGammaShape1(k) * theta;
+  // R_vanishのための分布: 切断正規分布(truncated normal)。N(mu, sigma)を
+  // サンプリングし、負の値が出たら捨てて振り直す(棄却サンプリング)。
+  //
+  // 【なぜ「折り返し(fold)」ではなく「切断(truncate)」なのか】
+  // 以前は Math.abs(sampleGaussian(mu, sigma)) で負の値を正に折り返していたが、
+  // これだと元の値がx(>0)だった場合と-x(<0)だった場合の両方が、折り返し後は
+  // 同じ値xになってしまう。つまり0以外の値xの密度は、N(mu,sigma)がxで持つ
+  // 密度と、N(mu,sigma)が-xで持つ密度の「合計(2つ分)」になり、素のN(mu,sigma)
+  // をそのまま正の範囲に置いた場合より不均衡に密度が高くなる(=数学的に言うと
+  // 二重に数えている)。これが指摘された「0以外はみんな確率が2倍」の正体。
+  // 切断正規分布はその逆で、負の値が出たら単に捨てて(=その試行を無効として
+  // カウントしない)、正の範囲だけを取り直す。これにより正の範囲上の相対的な
+  // 確率の比は、素のN(mu,sigma)の相対的な比とそのまま一致する(二重カウント
+  // が起きない)。全体を積分して1になるように定数Zで割るだけの、正規化された
+  // 「N(mu,sigma)を0以上に制限しただけ」の分布になる。
+  function sampleTruncatedGaussian(mu, sigma) {
+    if (sigma <= 0) return Math.max(0, mu);
+    let x;
+    do {
+      x = sampleGaussian(mu, sigma);
+    } while (x < 0);
+    return x;
   }
 
-  // 実際にストローク開始時に使うR_vanishの値。ガンマ分布の値を
-  // rLimit(限界半径)で上から切り詰める(=打ち切り/censoredガンマ分布)。
-  // これにより「sigmaがどれだけ大きくても、消失海域の厚みは絶対にrLimitを
-  // 超えない」という上限を明示的に持たせる。sigmaがmuに対して十分大きく
-  // なるとrLimitちょうどに張り付く試行が増える(=消失海域が常に最大の
-  // 厚みで存在する状態に近づく)点は変わらないが、ガンマ分布そのものが
-  // sigma/muの比で"ばらけ方"を制御しているため、切り詰めが無くても
-  // sigmaの役割が数学的に正しく機能する。
-  function sampleRVanish(mu, sigma, rLimit) {
-    const raw = sampleGamma(mu, sigma);
-    return rLimit > 0 ? Math.min(raw, rLimit) : raw;
+  // 実際にストローク開始時に使うR_vanishの値。rLimitEnabledがtrueのときだけ
+  // rLimitで上から切り詰める(=打ち切り/censored切断正規分布)。
+  // 打ち切りを有効にすると、sigmaを上げすぎた場合に値が0とrLimitの2点に
+  // 集中していく(Bhatia-Davis不等式による数学的必然、上のコメント参照)。
+  // 無効ならR_vanishは無制限で、sigmaがどれだけ大きくても分布は滑らかに
+  // 広がり続ける。
+  function sampleRVanish(mu, sigma, rLimit, rLimitEnabled) {
+    const raw = sampleTruncatedGaussian(mu, sigma);
+    return rLimitEnabled && rLimit > 0 ? Math.min(raw, rLimit) : raw;
   }
 
   // ------------------------------------------------------------------
-  // 分布の形そのもの(ガンマ分布のPDF)を可視化するための小さなグラフ。
-  // JSにはガンマ関数(Γ)が標準で無いため、Lanczos近似でlnΓ(x)を計算し、
-  // そこからPDFを対数領域で計算して指数を取る(数値的に安定させるため)。
+  // 分布の形そのもの(切断正規分布のPDF)を可視化するための小さなグラフ。
+  // 標準正規分布の密度phi(z)=exp(-z^2/2)/sqrt(2*pi)と累積分布Phi(z)を使い、
+  // f(x) = phi((x-mu)/sigma)/sigma / Phi(mu/sigma) (x>=0)
+  // として計算する(分母のPhi(mu/sigma)は「N(mu,sigma)が0以上になる確率」で、
+  // 正の範囲だけを積分して1にするための正規化定数)。折り返しのときのような
+  // 「+xと-xの密度を足す」二重カウントは無い(単純にN(mu,sigma)を0以上に
+  // 制限して定数で正規化しただけ)。Phi(累積分布)は誤差関数erfの近似式
+  // (Abramowitz-Stegun 7.1.26, 最大誤差約1.5e-7)で計算する。
   // ------------------------------------------------------------------
-  function lnGamma(x) {
-    const g = 7;
-    const c = [
-      0.99999999999980993, 676.5203681218851, -1259.1392167224028,
-      771.32342877765313, -176.61502916214059, 12.507343278686905,
-      -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7,
-    ];
-    if (x < 0.5) {
-      // 反射公式でx<0.5の場合もカバー(kが極小のときの安全策)
-      return Math.log(Math.PI / Math.sin(Math.PI * x)) - lnGamma(1 - x);
-    }
-    x -= 1;
-    let a = c[0];
-    const t = x + g + 0.5;
-    for (let i = 1; i < g + 2; i++) a += c[i] / (x + i);
-    return 0.5 * Math.log(2 * Math.PI) + (x + 0.5) * Math.log(t) - t + Math.log(a);
+  function normPdf(z) {
+    return Math.exp(-0.5 * z * z) / Math.sqrt(2 * Math.PI);
   }
-
-  // ガンマ分布(形状k, 尺度theta)のPDFをx地点で評価する。x<=0は0を返す
-  // (k<1のときx→0でPDFは理論上+∞に発散するが、グラフ表示では後段で
-  // 上限にクリップして「0付近で急激に立ち上がる」ことだけを見せる)。
-  function gammaPdf(x, k, theta) {
-    if (x <= 0 || k <= 0 || theta <= 0) return 0;
-    const logPdf = (k - 1) * Math.log(x) - x / theta - k * Math.log(theta) - lnGamma(k);
-    return Math.exp(logPdf);
+  function erf(x) {
+    const sign = x < 0 ? -1 : 1;
+    x = Math.abs(x);
+    const p = 0.3275911;
+    const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741,
+          a4 = -1.453152027, a5 = 1.061405429;
+    const t = 1 / (1 + p * x);
+    const y = 1 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
+    return sign * y;
+  }
+  function normCdf(z) {
+    return 0.5 * (1 + erf(z / Math.SQRT2));
+  }
+  function truncatedGaussianPdf(x, mu, sigma) {
+    if (x < 0 || sigma <= 0) return 0;
+    const z = normCdf(mu / sigma); // = P(N(mu,sigma) >= 0)、正規化定数
+    if (z <= 0) return 0;
+    return normPdf((x - mu) / sigma) / sigma / z;
   }
 
   function drawBermudaDistPlot() {
-    const { mu, sigma, epsilon, rLimit } = getBermudaParams();
+    const { mu, sigma, epsilon, rLimit, rLimitEnabled } = getBermudaParams();
     const ctx = bermudaDistCtx;
     const W = bermudaDistCanvas.width, H = bermudaDistCanvas.height;
     ctx.clearRect(0, 0, W, H);
 
     const padL = 6, padR = 6, padT = 8, padB = 16;
     const plotW = W - padL - padR, plotH = H - padT - padB;
+    const rLimitForScale = rLimitEnabled ? rLimit : 0;
 
     if (sigma <= 0) {
       // sigma=0は退化分布(常にmuちょうど)なので、PDFの代わりに縦線1本を描く
-      const xMax = Math.max(mu * 1.5, rLimit, 0.05);
+      const xMax = Math.max(mu * 1.5, rLimitForScale, 0.05);
       const xToPx = (x) => padL + (x / xMax) * plotW;
       ctx.strokeStyle = "#0f172a";
       ctx.lineWidth = 2;
@@ -841,29 +834,22 @@
       ctx.lineTo(xToPx(mu), padT + plotH);
       ctx.stroke();
     } else {
-      const k = (mu / sigma) * (mu / sigma);
-      const theta = (sigma * sigma) / mu;
-      // 表示範囲: mu+4*sigmaかR_limitの少し外側のうち大きい方まで
-      const xMax = Math.max(mu + 4 * sigma, rLimit * 1.15, mu * 1.2, 0.02);
+      // 表示範囲: mu+4*sigmaか(有効なら)R_limitの少し外側のうち大きい方まで
+      const xMax = Math.max(mu + 4 * sigma, rLimitForScale * 1.15, mu * 1.2, 0.02);
       const N = 120;
       const xs = new Array(N + 1);
       const ys = new Array(N + 1);
+      let yMax = 0;
       for (let i = 0; i <= N; i++) {
         const x = (xMax * i) / N;
         xs[i] = x;
-        ys[i] = i === 0 ? 0 : gammaPdf(x, k, theta);
-      }
-      // k<1だと最初の数点が発散して他が見えなくなるので、
-      // x >= xMax*0.03 の範囲でスケールの基準となる最大値を決める
-      let yMax = 0;
-      for (let i = 0; i <= N; i++) {
-        if (xs[i] >= xMax * 0.03 && isFinite(ys[i])) yMax = Math.max(yMax, ys[i]);
+        ys[i] = truncatedGaussianPdf(x, mu, sigma);
+        yMax = Math.max(yMax, ys[i]);
       }
       if (yMax <= 0 || !isFinite(yMax)) yMax = 1;
-      const yCap = yMax * 1.15; // これより高い値(発散スパイク)は頭打ちにする
 
       const xToPx = (x) => padL + (x / xMax) * plotW;
-      const yToPx = (y) => padT + plotH - (Math.min(y, yCap) / yCap) * plotH;
+      const yToPx = (y) => padT + plotH - (y / yMax) * plotH;
 
       ctx.strokeStyle = "#f97316";
       ctx.lineWidth = 2;
@@ -879,7 +865,7 @@
       for (let i = 0; i <= N; i++) ctx.lineTo(xToPx(xs[i]), yToPx(ys[i]));
       ctx.stroke();
 
-      // 縦の目印: μ(グレー破線)、ε(緑点線)、R_limit(紺色実線)
+      // 縦の目印: μ(グレー破線)、ε(緑点線)、R_limit(紺色実線、有効時のみ)
       const drawVLine = (x, color, dash) => {
         if (x < 0 || x > xMax) return;
         ctx.save();
@@ -894,7 +880,7 @@
       };
       drawVLine(mu, "#64748b", [4, 3]);
       drawVLine(epsilon, "#22c55e", [1, 2]);
-      if (rLimit > 0) drawVLine(rLimit, "#1e293b", null);
+      if (rLimitEnabled && rLimit > 0) drawVLine(rLimit, "#1e293b", null);
 
       // 今回サンプリングされた値を紫の点でx軸上に打つ
       if (hasBermudaSample && currentRVanishNorm >= 0 && currentRVanishNorm <= xMax) {
@@ -972,12 +958,13 @@
   // 「到達」になる、という今の到達判定がそのまま視覚的に読めるようにしている。
   function drawBermudaOverlay() {
     if (!bermuda) return;
-    const { rBalmuda, mu, epsilon, rLimit } = getBermudaParams();
+    const { rBalmuda, mu, epsilon, rLimit, rLimitEnabled } = getBermudaParams();
     const rCorePx = normToPx(rBalmuda);
 
-    // 限界半径rLimitの外周(常時表示、太めの実線)。R_vanishはどれだけsigmaを
-    // 大きくしてもこのリングより外に出ない、という絶対的な上限を示す。
-    if (rLimit > 0) {
+    // 限界半径rLimitの外周(rLimitEnabledのときだけ表示、太めの実線)。
+    // 有効な間はR_vanishがどれだけsigmaを大きくしてもこのリングより外に
+    // 出ない、という絶対的な上限を示す。
+    if (rLimitEnabled && rLimit > 0) {
       const limitRingPx = rCorePx + normToPx(rLimit);
       ctx.save();
       ctx.setLineDash([]);
@@ -1112,12 +1099,14 @@
 
     // バミューダが置かれていれば、この試行のR_vanishをここでサンプリングする
     // (試行=レコードを開始するたび、つまりストロークごとに毎回引き直す)。
-    // ガンマ分布(平均=mu, 標準偏差=sigma)を rLimit で上から打ち切ってサンプリングする。
-    // sigmaがmuに対して小さいとmuの近くに張り付き(釣鐘型)、sigmaが大きいと
-    // 0〜rLimitの範囲でよくばらける(=CV=sigma/muが大きいほど非対称に広がる)。
+    // 切断正規分布(N(mu,sigma)を0以上に制限したもの)からサンプリングする。
+    // sigmaが小さいとmuの近くにタイトな山、sigmaが大きいと0〜広い範囲へ
+    // 末広がりに広がる。rLimitEnabledがtrueのときだけrLimitで上から
+    // 打ち切る(ただしその場合、sigmaを上げすぎると0とrLimitの2点に
+    // 値が集中していく=Bhatia-Davis不等式による数学的必然)。
     if (bermuda) {
-      const { mu, sigma, rLimit } = getBermudaParams();
-      currentRVanishNorm = sampleRVanish(mu, sigma, rLimit);
+      const { mu, sigma, rLimit, rLimitEnabled } = getBermudaParams();
+      currentRVanishNorm = sampleRVanish(mu, sigma, rLimit, rLimitEnabled);
       currentRVanishPx = normToPx(currentRVanishNorm);
       hasBermudaSample = true;
       bermudaStats.attempts++;
@@ -1722,12 +1711,17 @@
     redrawAll();
     log("バミューダを削除しました");
   });
-  // R_balmuda/μ/σを変更したら、即座にμリングやバミューダ本体の見た目・表示中のμ値に反映する
+  // R_balmuda/μ/σ/ε/R_limitを変更したら、即座にリングや分布グラフ・
+  // 表示中の値に反映する
   [bermudaRadiusInput, bermudaMuInput, bermudaSigmaInput, bermudaEpsilonInput, bermudaRLimitInput].forEach((el) => {
     el.addEventListener("input", () => {
       updateBermudaStatsUI();
       redrawAll();
     });
+  });
+  bermudaRLimitEnabledInput.addEventListener("change", () => {
+    updateBermudaStatsUI();
+    redrawAll();
   });
 
   function sleep(ms) {
