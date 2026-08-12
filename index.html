@@ -209,6 +209,42 @@
   .family-item button.edit { background: #4b5563; }
   .family-item button.del { background: var(--danger); }
   #exportBtn { width: 100%; }
+  #preprocessPanel {
+    width: var(--canvas-size);
+    max-width: 100%;
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+    padding: 10px 12px;
+  }
+  #preprocessHeader {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink);
+    margin-bottom: 6px;
+  }
+  .preprocess-controls {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+    align-items: center;
+  }
+  .preprocess-controls label {
+    font-size: 12px;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .preprocess-controls input[type="number"] {
+    width: 64px;
+    padding: 4px 6px;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    font-size: 13px;
+  }
+  #ppExportBtn { width: 100%; }
   #editBanner {
     width: var(--canvas-size);
     max-width: 100%;
@@ -348,6 +384,24 @@
     <button id="exportBtn">Familyを書き出す (JSON)</button>
   </div>
 
+  <div id="preprocessPanel">
+    <div id="preprocessHeader">前処理 (npz書き出し) — RNN学習用にFamily全体をその場で変換してダウンロード</div>
+    <div class="preprocess-controls">
+      <label><input type="radio" name="preprocessMode" value="hz_pad" id="ppModeHzPad" checked> Hz固定+パディング</label>
+      <label><input type="radio" name="preprocessMode" value="fixed_frames" id="ppModeFixedFrames"> フレーム数固定(パディング無し)</label>
+    </div>
+    <div class="preprocess-controls">
+      <label id="ppHzLabel">Hz <input id="ppHzInput" type="number" inputmode="decimal" step="1" min="1" value="20"></label>
+      <label id="ppFrameCountLabel" style="display:none;">フレーム数 <input id="ppFrameCountInput" type="number" inputmode="decimal" step="1" min="2" value="250"></label>
+    </div>
+    <div class="preprocess-controls">
+      <label><input type="checkbox" id="ppIncludePressure"> pressure(筆圧)</label>
+      <label><input type="checkbox" id="ppIncludeTilt"> tiltX/tiltY(傾き)</label>
+      <label><input type="checkbox" id="ppIncludeVelocity"> velocity(vx,vy)</label>
+    </div>
+    <button id="ppExportBtn">npzを書き出す</button>
+  </div>
+
   <div id="log"></div>
 </div>
 
@@ -376,6 +430,16 @@
   const clearBtn = document.getElementById("clearBtn");
   const addBtn = document.getElementById("addBtn");
   const exportBtn = document.getElementById("exportBtn");
+  const ppModeHzPad = document.getElementById("ppModeHzPad");
+  const ppModeFixedFrames = document.getElementById("ppModeFixedFrames");
+  const ppHzLabel = document.getElementById("ppHzLabel");
+  const ppFrameCountLabel = document.getElementById("ppFrameCountLabel");
+  const ppHzInput = document.getElementById("ppHzInput");
+  const ppFrameCountInput = document.getElementById("ppFrameCountInput");
+  const ppIncludePressure = document.getElementById("ppIncludePressure");
+  const ppIncludeTilt = document.getElementById("ppIncludeTilt");
+  const ppIncludeVelocity = document.getElementById("ppIncludeVelocity");
+  const ppExportBtn = document.getElementById("ppExportBtn");
   const playBtn = document.getElementById("playBtn");
   const editConfirmBtn = document.getElementById("editConfirmBtn");
   const editCancelBtn = document.getElementById("editCancelBtn");
@@ -1829,6 +1893,334 @@
     a.remove();
     URL.revokeObjectURL(url);
     log(`書き出しました: ${family.length}シーケンス`);
+  });
+
+  // ------------------------------------------------------------------
+  // 前処理 (npz書き出し): 今まで別スクリプト(preprocess.py)でやっていた
+  // リサンプリング+パディングを、アプリ内でその場で行いnpzとしてダウンロードする。
+  // numpyのnp.load()でそのまま読める.npzファイルを、外部ライブラリなしで
+  // ブラウザのJSだけで生成する(NPYヘッダを自前で組み立て、ZIPも無圧縮
+  // (store)方式で自前実装。iPadがオフラインでも動くようにするため)。
+  // ------------------------------------------------------------------
+
+  [ppModeHzPad, ppModeFixedFrames].forEach((el) => {
+    el.addEventListener("change", () => {
+      const isHzPad = ppModeHzPad.checked;
+      ppHzLabel.style.display = isHzPad ? "" : "none";
+      ppFrameCountLabel.style.display = isHzPad ? "none" : "";
+    });
+  });
+
+  function crc32(bytes) {
+    let table = crc32.table;
+    if (!table) {
+      table = crc32.table = new Uint32Array(256);
+      for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = c & 1 ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+        table[n] = c;
+      }
+    }
+    let crc = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) crc = table[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  function asciiBytes(str) {
+    const arr = new Uint8Array(str.length);
+    for (let i = 0; i < str.length; i++) arr[i] = str.charCodeAt(i) & 0xff;
+    return arr;
+  }
+
+  function concatBytes(arrays) {
+    let total = 0;
+    for (const a of arrays) total += a.length;
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const a of arrays) { out.set(a, off); off += a.length; }
+    return out;
+  }
+
+  function shapeToStr(shape) {
+    if (shape.length === 1) return `(${shape[0]},)`;
+    return `(${shape.join(", ")})`;
+  }
+
+  // 1つの.npyファイルの中身をまるごと組み立てる。
+  // descr例: '<f4'(float32), '<i8'(int64), '|S8'(8バイト固定長ASCII文字列)
+  function buildNpy(shape, descr, dataBytes) {
+    const dictStr = `{'descr': '${descr}', 'fortran_order': False, 'shape': ${shapeToStr(shape)}, }`;
+    const prefixLen = 6 + 2 + 2; // magic(6) + version(2) + header_len field(2, v1.0)
+    let headerLen = dictStr.length + 1; // +1 は末尾の"\n"
+    const pad = (64 - ((prefixLen + headerLen) % 64)) % 64;
+    const header = dictStr + " ".repeat(pad) + "\n";
+    headerLen = header.length;
+
+    const magic = new Uint8Array([0x93, 0x4e, 0x55, 0x4d, 0x50, 0x59]); // \x93NUMPY
+    const version = new Uint8Array([1, 0]);
+    const headerLenBytes = new Uint8Array([headerLen & 0xff, (headerLen >> 8) & 0xff]);
+    return concatBytes([magic, version, headerLenBytes, asciiBytes(header), dataBytes]);
+  }
+
+  function float32ToBytes(values) {
+    const buf = new ArrayBuffer(values.length * 4);
+    const view = new DataView(buf);
+    for (let i = 0; i < values.length; i++) view.setFloat32(i * 4, values[i], true);
+    return new Uint8Array(buf);
+  }
+
+  // BigInt64は使わず下位32bit(実際の値)+上位32bit(常に0)を直接書き込む
+  // (シーケンス長・フレーム数は非負で十分小さいので安全。iPadOS Safariの
+  // バージョン差でBigInt64系が使えない場合を避けるため)。
+  function int64ToBytes(values) {
+    const buf = new ArrayBuffer(values.length * 8);
+    const view = new DataView(buf);
+    for (let i = 0; i < values.length; i++) {
+      view.setUint32(i * 8, Math.round(values[i]), true);
+      view.setUint32(i * 8 + 4, 0, true);
+    }
+    return new Uint8Array(buf);
+  }
+
+  function stringsToFixedBytes(strings) {
+    let maxLen = 1;
+    for (const s of strings) maxLen = Math.max(maxLen, s.length);
+    const buf = new Uint8Array(strings.length * maxLen);
+    for (let i = 0; i < strings.length; i++) buf.set(asciiBytes(strings[i]), i * maxLen);
+    return { bytes: buf, maxLen };
+  }
+
+  // ZIP(store方式、無圧縮)を組み立てる。files: [{name, data(Uint8Array)}]
+  function buildZip(files) {
+    const localParts = [];
+    const centralParts = [];
+    let offset = 0;
+
+    for (const f of files) {
+      const nameBytes = asciiBytes(f.name);
+      const crc = crc32(f.data);
+      const size = f.data.length;
+
+      const local = new Uint8Array(30);
+      const lv = new DataView(local.buffer);
+      lv.setUint32(0, 0x04034b50, true);
+      lv.setUint16(4, 20, true);
+      lv.setUint16(6, 0, true);
+      lv.setUint16(8, 0, true);
+      lv.setUint16(10, 0, true);
+      lv.setUint16(12, 0, true);
+      lv.setUint32(14, crc, true);
+      lv.setUint32(18, size, true);
+      lv.setUint32(22, size, true);
+      lv.setUint16(26, nameBytes.length, true);
+      lv.setUint16(28, 0, true);
+
+      const localEntry = concatBytes([local, nameBytes, f.data]);
+      localParts.push(localEntry);
+
+      const central = new Uint8Array(46);
+      const cv = new DataView(central.buffer);
+      cv.setUint32(0, 0x02014b50, true);
+      cv.setUint16(4, 20, true);
+      cv.setUint16(6, 20, true);
+      cv.setUint16(8, 0, true);
+      cv.setUint16(10, 0, true);
+      cv.setUint16(12, 0, true);
+      cv.setUint16(14, 0, true);
+      cv.setUint32(16, crc, true);
+      cv.setUint32(20, size, true);
+      cv.setUint32(24, size, true);
+      cv.setUint16(28, nameBytes.length, true);
+      cv.setUint16(30, 0, true);
+      cv.setUint16(32, 0, true);
+      cv.setUint16(34, 0, true);
+      cv.setUint16(36, 0, true);
+      cv.setUint32(38, 0, true);
+      cv.setUint32(42, offset, true);
+
+      centralParts.push(concatBytes([central, nameBytes]));
+      offset += localEntry.length;
+    }
+
+    const centralDirStart = offset;
+    const centralDirBytes = concatBytes(centralParts);
+
+    const end = new Uint8Array(22);
+    const ev = new DataView(end.buffer);
+    ev.setUint32(0, 0x06054b50, true);
+    ev.setUint16(4, 0, true);
+    ev.setUint16(6, 0, true);
+    ev.setUint16(8, files.length, true);
+    ev.setUint16(10, files.length, true);
+    ev.setUint32(12, centralDirBytes.length, true);
+    ev.setUint32(16, centralDirStart, true);
+    ev.setUint16(20, 0, true);
+
+    return concatBytes([...localParts, centralDirBytes, end]);
+  }
+
+  // t_rawに対するv_rawを、t_grid上へ線形補間する(np.interpのJS版、範囲外はクランプ)
+  function linterp(tGrid, tRaw, vRaw) {
+    const n = tRaw.length;
+    const out = new Array(tGrid.length);
+    let j = 0;
+    for (let i = 0; i < tGrid.length; i++) {
+      const t = tGrid[i];
+      if (t <= tRaw[0]) { out[i] = vRaw[0]; continue; }
+      if (t >= tRaw[n - 1]) { out[i] = vRaw[n - 1]; continue; }
+      while (j < n - 2 && tRaw[j + 1] < t) j++;
+      const t0 = tRaw[j], t1 = tRaw[j + 1];
+      const v0 = vRaw[j], v1 = vRaw[j + 1];
+      const frac = t1 > t0 ? (t - t0) / (t1 - t0) : 0;
+      out[i] = v0 + frac * (v1 - v0);
+    }
+    return out;
+  }
+
+  // 1シーケンスをtGrid(ms、昇順)上へリサンプリングする。
+  // 戻り値: {x, y, pressure, tiltX, tiltY} の各配列(すべてtGridと同じ長さ)
+  function resampleSeqToGrid(points, tGrid) {
+    if (points.length < 2) {
+      const p = points[0] || { x: 0, y: 0, pressure: 0, tiltX: 0, tiltY: 0 };
+      const n = tGrid.length;
+      return {
+        x: new Array(n).fill(p.x || 0),
+        y: new Array(n).fill(p.y || 0),
+        pressure: new Array(n).fill(p.pressure || 0),
+        tiltX: new Array(n).fill(p.tiltX || 0),
+        tiltY: new Array(n).fill(p.tiltY || 0),
+      };
+    }
+    const tRaw = points.map((p) => p.t);
+    const xRaw = points.map((p) => p.x);
+    const yRaw = points.map((p) => p.y);
+    const pressureRaw = points.map((p) => p.pressure || 0);
+    const tiltXRaw = points.map((p) => (typeof p.tiltX === "number" ? p.tiltX : 0));
+    const tiltYRaw = points.map((p) => (typeof p.tiltY === "number" ? p.tiltY : 0));
+    return {
+      x: linterp(tGrid, tRaw, xRaw),
+      y: linterp(tGrid, tRaw, yRaw),
+      pressure: linterp(tGrid, tRaw, pressureRaw),
+      tiltX: linterp(tGrid, tRaw, tiltXRaw),
+      tiltY: linterp(tGrid, tRaw, tiltYRaw),
+    };
+  }
+
+  // リサンプリング後の等間隔dt(ms)を使って有限差分でvelocity(vx,vy)を計算する。
+  // 最初のフレームはvelocity=0とする(合意した仕様)。
+  function computeVelocity(xs, ys, dtMs) {
+    const n = xs.length;
+    const vx = new Array(n).fill(0);
+    const vy = new Array(n).fill(0);
+    const dtSec = dtMs / 1000;
+    for (let i = 1; i < n; i++) {
+      vx[i] = (xs[i] - xs[i - 1]) / dtSec;
+      vy[i] = (ys[i] - ys[i - 1]) / dtSec;
+    }
+    return { vx, vy };
+  }
+
+  // Family全体をUIで選んだ設定に従ってリサンプリングし、
+  // {xyFlat(T*Nseq*out), T, Nseq, out, seqLengths, channelNames} を返す。
+  function computePreprocessed(options) {
+    const seqs = family;
+    const Nseq = seqs.length;
+    const channelNames = ["x", "y"];
+    if (options.includePressure) channelNames.push("pressure");
+    if (options.includeTilt) channelNames.push("tiltX", "tiltY");
+    if (options.includeVelocity) channelNames.push("vx", "vy");
+    const out = channelNames.length;
+
+    const perSeq = []; // 各要素: {arrays: {x,y,pressure,tiltX,tiltY,vx,vy}, length}
+
+    for (const seq of seqs) {
+      const points = seq.points;
+      const tRaw0 = points.length > 0 ? points[0].t : 0;
+      const tRawLast = points.length > 0 ? points[points.length - 1].t : 0;
+      let tGrid, dtMs;
+      if (options.mode === "hz_pad") {
+        const stepMs = 1000 / options.hz;
+        const durationMs = tRawLast - tRaw0;
+        const nSteps = Math.max(1, Math.round(durationMs / stepMs) + 1);
+        tGrid = Array.from({ length: nSteps }, (_, i) => tRaw0 + i * stepMs);
+        dtMs = stepMs;
+      } else {
+        const n = Math.max(2, Math.round(options.frameCount));
+        tGrid = Array.from({ length: n }, (_, i) => tRaw0 + ((tRawLast - tRaw0) * i) / (n - 1));
+        dtMs = n > 1 ? (tRawLast - tRaw0) / (n - 1) : 0;
+      }
+
+      const res = resampleSeqToGrid(points, tGrid);
+      const arrays = { x: res.x, y: res.y };
+      if (options.includePressure) arrays.pressure = res.pressure;
+      if (options.includeTilt) { arrays.tiltX = res.tiltX; arrays.tiltY = res.tiltY; }
+      if (options.includeVelocity) {
+        const v = computeVelocity(res.x, res.y, dtMs);
+        arrays.vx = v.vx; arrays.vy = v.vy;
+      }
+      perSeq.push({ arrays, length: tGrid.length });
+    }
+
+    const Tmax = options.mode === "hz_pad"
+      ? Math.max(...perSeq.map((s) => s.length))
+      : Math.max(2, Math.round(options.frameCount));
+
+    const xyFlat = new Array(Tmax * Nseq * out).fill(0); // (T,Nseq,out)、C-order、パディング分は0初期化済み
+    const seqLengths = new Array(Nseq);
+
+    for (let s = 0; s < Nseq; s++) {
+      const { arrays, length } = perSeq[s];
+      seqLengths[s] = length;
+      for (let t = 0; t < length; t++) {
+        const base = (t * Nseq + s) * out;
+        for (let c = 0; c < out; c++) {
+          xyFlat[base + c] = arrays[channelNames[c]][t];
+        }
+      }
+    }
+
+    return { xyFlat, T: Tmax, Nseq, out, seqLengths, channelNames };
+  }
+
+  ppExportBtn.addEventListener("click", () => {
+    if (family.length === 0) {
+      log("書き出すFamilyがありません（＋で追加してください）");
+      return;
+    }
+    const options = {
+      mode: ppModeHzPad.checked ? "hz_pad" : "fixed_frames",
+      hz: Math.max(1, parseFloat(ppHzInput.value) || 20),
+      frameCount: Math.max(2, Math.round(parseFloat(ppFrameCountInput.value) || 250)),
+      includePressure: ppIncludePressure.checked,
+      includeTilt: ppIncludeTilt.checked,
+      includeVelocity: ppIncludeVelocity.checked,
+    };
+
+    const { xyFlat, T, Nseq, out, seqLengths, channelNames } = computePreprocessed(options);
+
+    const xyNpy = buildNpy([T, Nseq, out], "<f4", float32ToBytes(xyFlat));
+    const seqLenNpy = buildNpy([Nseq], "<i8", int64ToBytes(seqLengths));
+    const { bytes: chBytes, maxLen } = stringsToFixedBytes(channelNames);
+    const chNpy = buildNpy([channelNames.length], "|S" + maxLen, chBytes);
+
+    const zipBytes = buildZip([
+      { name: "xy.npy", data: xyNpy },
+      { name: "seq_lengths.npy", data: seqLenNpy },
+      { name: "channel_names.npy", data: chNpy },
+    ]);
+
+    const blob = new Blob([zipBytes], { type: "application/octet-stream" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const modeTag = options.mode === "hz_pad" ? `hz${options.hz}` : `frames${options.frameCount}`;
+    a.href = url;
+    a.download = `preprocessed_${modeTag}_${stamp}.npz`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    log(`npzを書き出しました: xy shape=(${T}, ${Nseq}, ${out})、channels=[${channelNames.join(", ")}]`);
   });
 
   // ------------------------------------------------------------------
