@@ -403,6 +403,9 @@
       <label style="flex:1;">保存名 <input id="ppFilenameInput" type="text" placeholder="未入力なら自動命名" style="flex:1; padding:4px 6px; border:1px solid #d1d5db; border-radius:6px; font-size:13px;"></label>
       <label><input type="checkbox" id="ppIncludeRawJson" checked> 生データ(json)も一緒に書き出す</label>
     </div>
+    <div class="preprocess-controls">
+      <label><input type="checkbox" id="ppUseShareSheet" checked> 共有シートで保存先を選ぶ(OneDrive等へ直接保存可能。非対応環境ではDownloadsフォルダへの通常ダウンロードに自動で切り替わります)</label>
+    </div>
     <button id="ppExportBtn">npzを書き出す</button>
   </div>
 
@@ -445,6 +448,7 @@
   const ppIncludeVelocity = document.getElementById("ppIncludeVelocity");
   const ppFilenameInput = document.getElementById("ppFilenameInput");
   const ppIncludeRawJson = document.getElementById("ppIncludeRawJson");
+  const ppUseShareSheet = document.getElementById("ppUseShareSheet");
   const ppExportBtn = document.getElementById("ppExportBtn");
   const playBtn = document.getElementById("playBtn");
   const editConfirmBtn = document.getElementById("editConfirmBtn");
@@ -2238,19 +2242,54 @@
     const typed = sanitizeFilenameBase(ppFilenameInput.value || "");
     const baseName = typed || `preprocessed_${modeTag}_${stamp}`;
 
-    downloadBlob(new Blob([zipBytes], { type: "application/octet-stream" }), `${baseName}.npz`);
-
-    // 生データ(json)も一緒に書き出す(チェックが入っている場合。npzと同じ
-    // 保存名を使うので、後から見てもどのnpzがどのjsonから作られたか対応が付く)
+    const npzFile = new File([zipBytes], `${baseName}.npz`, { type: "application/octet-stream" });
+    let jsonFile = null;
     if (ppIncludeRawJson.checked) {
       const rawPayload = buildFamilyJsonPayload();
-      downloadBlob(
-        new Blob([JSON.stringify(rawPayload)], { type: "application/json" }),
-        `${baseName}_raw.json`
-      );
+      jsonFile = new File([JSON.stringify(rawPayload)], `${baseName}_raw.json`, { type: "application/json" });
+    }
+    const filesToShare = jsonFile ? [npzFile, jsonFile] : [npzFile];
+    const summary = `xy shape=(${T}, ${Nseq}, ${out})、channels=[${channelNames.join(", ")}]、保存名=${baseName}`;
+
+    // iPadOS Safariの通常ダウンロード(<a download>)は保存先を選べず、常に
+    // Downloadsフォルダ固定になる。Web Share API(共有シート)を使うと、
+    // OneDriveやiCloud Drive、AirDropなど好きな保存先を毎回選べる。
+    // 対応していない環境(古いSafari/他ブラウザ)では通常ダウンロードに
+    // 自動で切り替える。
+    const canUseShare = ppUseShareSheet.checked
+      && typeof navigator.share === "function"
+      && typeof navigator.canShare === "function"
+      && navigator.canShare({ files: filesToShare });
+
+    function fallbackToDownload() {
+      // 1回のクリック処理の中で複数のダウンロードを連続発生させると、
+      // iPadOS Safariでは2つ目以降が正しく扱われないことがあるため、
+      // 間隔を空けて(setTimeoutで)別々にダウンロードさせる。
+      downloadBlob(new Blob([zipBytes], { type: "application/octet-stream" }), npzFile.name);
+      log(`npzを書き出しました: ${summary}`);
+      log(`ダイアログが出たら「表示」ではなく「ダウンロード」を選んでください(「表示」だとDownloadsフォルダに保存されません)`);
+      if (jsonFile) {
+        setTimeout(() => {
+          downloadBlob(jsonFile, jsonFile.name);
+          log(`生データ(json)も書き出しました: ${jsonFile.name}（こちらも「ダウンロード」を選んでください）`);
+        }, 600);
+      }
     }
 
-    log(`npzを書き出しました: xy shape=(${T}, ${Nseq}, ${out})、channels=[${channelNames.join(", ")}]、保存名=${baseName}`);
+    if (canUseShare) {
+      navigator.share({ files: filesToShare })
+        .then(() => log(`共有シート経由で書き出しました: ${summary}`))
+        .catch((err) => {
+          if (err && err.name === "AbortError") {
+            log("共有をキャンセルしました");
+            return;
+          }
+          log(`共有シートが使えなかったため通常ダウンロードに切り替えます (${err && err.message})`);
+          fallbackToDownload();
+        });
+    } else {
+      fallbackToDownload();
+    }
   });
 
   // ------------------------------------------------------------------
