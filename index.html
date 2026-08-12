@@ -165,6 +165,11 @@
     font-size: 13px;
     font-weight: 600;
     color: var(--ink);
+    margin-bottom: 2px;
+  }
+  #familyHeaderNote {
+    font-size: 11px;
+    color: var(--muted);
     margin-bottom: 6px;
   }
   #familyList {
@@ -379,7 +384,8 @@
   <div id="editBanner" style="display:none;"></div>
 
   <div id="familyPanel">
-    <div id="familyHeader">Family: <span id="familyCount">0</span> seqs / <span id="familyTimesteps">0</span> timesteps</div>
+    <div id="familyHeader">Family: <span id="familyCount">0</span> seqs / 合計<span id="familyTimesteps">0</span> timesteps(生データ、リサンプリング前)</div>
+    <div id="familyHeaderNote">各シーケンスの割合(%)は下の一覧に表示。timesteps数が多いほどRNNの学習で支配的になりやすい目安(「フレーム数固定」で前処理すれば全シーケンスが同じ長さになりこの偏りは無くなる)</div>
     <div id="familyList"></div>
     <button id="exportBtn">Familyを書き出す (JSON)</button>
   </div>
@@ -1492,12 +1498,18 @@
 
     familyListEl.innerHTML = "";
     family.forEach((m, i) => {
+      // 生のtimesteps数がFamily全体に占める割合(%)。RNNの損失を
+      // 単純に全timestepで平均する場合、この割合が大きいシーケンスほど
+      // 学習で支配的になりやすい(=どれがドミナントに学ばれそうかの目安)。
+      // 「フレーム数固定(パディング無し)」で前処理する場合は全シーケンスが
+      // 同じ長さになるのでこの偏りは無くなる点に注意。
+      const pct = totalTimesteps > 0 ? ((m.points.length / totalTimesteps) * 100).toFixed(1) : "0.0";
       const row = document.createElement("div");
       row.className = "family-item" + (locked ? " editing-locked" : "");
       row.innerHTML = `
         <canvas class="thumb" width="80" height="80"></canvas>
         <span class="swatch" style="background:${m.color}"></span>
-        <span class="label">Seq ${i}: ${m.points.length} timesteps</span>
+        <span class="label">Seq ${i}: ${m.points.length} timesteps (${pct}%)</span>
         <button class="play" ${locked ? "disabled" : ""}>▶</button>
         <button class="edit" ${locked ? "disabled" : ""}>編集</button>
         <button class="del" ${locked ? "disabled" : ""}>削除</button>
