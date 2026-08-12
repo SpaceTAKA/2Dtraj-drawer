@@ -399,6 +399,10 @@
       <label><input type="checkbox" id="ppIncludeTilt"> tiltX/tiltY(傾き)</label>
       <label><input type="checkbox" id="ppIncludeVelocity"> velocity(vx,vy)</label>
     </div>
+    <div class="preprocess-controls">
+      <label style="flex:1;">保存名 <input id="ppFilenameInput" type="text" placeholder="未入力なら自動命名" style="flex:1; padding:4px 6px; border:1px solid #d1d5db; border-radius:6px; font-size:13px;"></label>
+      <label><input type="checkbox" id="ppIncludeRawJson" checked> 生データ(json)も一緒に書き出す</label>
+    </div>
     <button id="ppExportBtn">npzを書き出す</button>
   </div>
 
@@ -439,6 +443,8 @@
   const ppIncludePressure = document.getElementById("ppIncludePressure");
   const ppIncludeTilt = document.getElementById("ppIncludeTilt");
   const ppIncludeVelocity = document.getElementById("ppIncludeVelocity");
+  const ppFilenameInput = document.getElementById("ppFilenameInput");
+  const ppIncludeRawJson = document.getElementById("ppIncludeRawJson");
   const ppExportBtn = document.getElementById("ppExportBtn");
   const playBtn = document.getElementById("playBtn");
   const editConfirmBtn = document.getElementById("editConfirmBtn");
@@ -1847,15 +1853,11 @@
     redrawAll();
   });
 
-  exportBtn.addEventListener("click", () => {
-    if (family.length === 0) {
-      log("書き出すFamilyがありません（＋で追加してください）");
-      return;
-    }
-    if (strokes.length > 0) {
-      log("注意: 下書き中の描画はFamilyに未追加です。含めたい場合は先に＋を押してください");
-    }
-    const payload = {
+  // Familyの生データ(json)を書き出す用のpayloadを組み立てる。
+  // exportBtn(生データのみのJSON書き出し)と、下のnpz書き出し(生データも
+  // 一緒に書き出すオプション付き)の両方から共通で使う。
+  function buildFamilyJsonPayload() {
+    return {
       meta: {
         app: "ipad-trajectory-capture",
         version: 2,
@@ -1882,16 +1884,31 @@
         points: m.points,
       })),
     };
-    const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
+  }
+
+  function downloadBlob(blob, filename) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    const stamp = payload.meta.recordedAt.replace(/[:.]/g, "-");
     a.href = url;
-    a.download = `family_${stamp}.json`;
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
+  }
+
+  exportBtn.addEventListener("click", () => {
+    if (family.length === 0) {
+      log("書き出すFamilyがありません（＋で追加してください）");
+      return;
+    }
+    if (strokes.length > 0) {
+      log("注意: 下書き中の描画はFamilyに未追加です。含めたい場合は先に＋を押してください");
+    }
+    const payload = buildFamilyJsonPayload();
+    const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
+    const stamp = payload.meta.recordedAt.replace(/[:.]/g, "-");
+    downloadBlob(blob, `family_${stamp}.json`);
     log(`書き出しました: ${family.length}シーケンス`);
   });
 
@@ -2182,6 +2199,12 @@
     return { xyFlat, T: Tmax, Nseq, out, seqLengths, channelNames };
   }
 
+  // 保存名の入力欄はファイル名として使うので、危なそうな文字だけ落とす
+  // (パス区切りや空白など。日本語や英数字・ハイフン・アンダースコアはそのまま通す)
+  function sanitizeFilenameBase(name) {
+    return name.trim().replace(/[\\/:*?"<>|\s]+/g, "_");
+  }
+
   ppExportBtn.addEventListener("click", () => {
     if (family.length === 0) {
       log("書き出すFamilyがありません（＋で追加してください）");
@@ -2209,18 +2232,25 @@
       { name: "channel_names.npy", data: chNpy },
     ]);
 
-    const blob = new Blob([zipBytes], { type: "application/octet-stream" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
+    // 保存名: 入力欄が空なら今までどおり自動命名(モード+タイムスタンプ)
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const modeTag = options.mode === "hz_pad" ? `hz${options.hz}` : `frames${options.frameCount}`;
-    a.href = url;
-    a.download = `preprocessed_${modeTag}_${stamp}.npz`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-    log(`npzを書き出しました: xy shape=(${T}, ${Nseq}, ${out})、channels=[${channelNames.join(", ")}]`);
+    const typed = sanitizeFilenameBase(ppFilenameInput.value || "");
+    const baseName = typed || `preprocessed_${modeTag}_${stamp}`;
+
+    downloadBlob(new Blob([zipBytes], { type: "application/octet-stream" }), `${baseName}.npz`);
+
+    // 生データ(json)も一緒に書き出す(チェックが入っている場合。npzと同じ
+    // 保存名を使うので、後から見てもどのnpzがどのjsonから作られたか対応が付く)
+    if (ppIncludeRawJson.checked) {
+      const rawPayload = buildFamilyJsonPayload();
+      downloadBlob(
+        new Blob([JSON.stringify(rawPayload)], { type: "application/json" }),
+        `${baseName}_raw.json`
+      );
+    }
+
+    log(`npzを書き出しました: xy shape=(${T}, ${Nseq}, ${out})、channels=[${channelNames.join(", ")}]、保存名=${baseName}`);
   });
 
   // ------------------------------------------------------------------
